@@ -1,0 +1,8 @@
+name = "ww-proxy"
+main = "src/index.ts"
+compatibility_date = "2024-11-27"
+compatibility_flags = ["nodejs_compat"]
+
+# Secrets should be set via:
+# wrangler secret put HERE_API_KEY
+# wrangler secret put SENTRY_DSN

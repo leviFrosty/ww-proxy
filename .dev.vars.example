@@ -1,0 +1,8 @@
+# Copy this file to .dev.vars and fill in your actual values
+# .dev.vars is used by wrangler for local development and is gitignored
+
+# HERE API key from https://developer.here.com/
+HERE_API_KEY=your_here_api_key_here
+
+# Sentry DSN from https://sentry.io/
+SENTRY_DSN=https://your-sentry-dsn@sentry.io/project-id
