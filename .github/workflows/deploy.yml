@@ -3,7 +3,7 @@ name: Deploy to Cloudflare Workers
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 jobs:
   deploy:
@@ -35,5 +35,5 @@ jobs:
 
       - name: Post-deployment health check
         run: |
-          sleep 10
-          curl -f https://ww-proxy.YOUR_SUBDOMAIN.workers.dev/health || exit 1
+          sleep 5
+          curl -f https://ww-proxy.levi-wilkerson.workers.dev/health || exit 1
