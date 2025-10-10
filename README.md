@@ -1,20 +1,12 @@
 # WW Proxy
 
-A Cloudflare Workers proxy service for HERE API endpoints with IP-based rate limiting and Sentry monitoring.
-
-## Features
-
-- **API Key Protection**: Hides HERE API key from client-side requests
-- 📊 **Monitoring**: Sentry integration for error tracking and analytics
-- ⚡ **Global Edge**: Deployed on Cloudflare Workers for low latency worldwide
-- 🎯 **Autocomplete & Geocoding**: Proxies HERE Geocode and Autocomplete APIs
+A lightweight Cloudflare Workers proxy service for HERE API endpoints with Sentry monitoring. Protects your HERE API key from client-side exposure while providing global edge performance.
 
 ## Prerequisites
 
 - [Bun](https://bun.sh/) installed
 - [Cloudflare account](https://dash.cloudflare.com/sign-up/workers-and-pages)
 - [HERE API key](https://developer.here.com/)
-- [Upstash Redis database](https://upstash.com/)
 - [Sentry account](https://sentry.io/) (optional but recommended)
 
 ## Setup
@@ -38,18 +30,6 @@ Edit `.dev.vars` with your actual values:
 ```bash
 HERE_API_KEY=your_here_api_key
 SENTRY_DSN=https://your-sentry-dsn@sentry.io/project-id
-UPSTASH_REDIS_REST_URL=https://your-redis.upstash.io
-UPSTASH_REDIS_REST_TOKEN=your_upstash_token
-```
-
-### 3. Configure rate limits (optional)
-
-Edit `wrangler.toml` to adjust rate limiting:
-
-```toml
-[vars]
-RATE_LIMIT_REQUESTS = "100"          # Number of requests allowed
-RATE_LIMIT_WINDOW_SECONDS = "3600"   # Time window in seconds (1 hour)
 ```
 
 ## Development
@@ -79,43 +59,57 @@ curl "http://localhost:8787/health"
 
 ### Manual deployment
 
-```bash
-# Set secrets (one-time setup)
-bunx wrangler secret put HERE_API_KEY
-bunx wrangler secret put SENTRY_DSN
-bunx wrangler secret put UPSTASH_REDIS_REST_URL
-bunx wrangler secret put UPSTASH_REDIS_REST_TOKEN
+Set secrets (one-time setup):
 
-# Deploy
+```bash
+bunx wrangler secret put HERE_API_KEY
+# Paste your HERE API key when prompted
+
+bunx wrangler secret put SENTRY_DSN
+# Paste your Sentry DSN when prompted
+```
+
+Verify secrets are set:
+
+```bash
+bunx wrangler secret list
+```
+
+Deploy to Cloudflare Workers:
+
+```bash
 bun run deploy
 ```
 
 ### Automatic deployment via GitHub Actions
 
-The project includes CI/CD that deploys automatically on git tags:
+The project includes CI/CD that deploys automatically on git tags.
 
-1. **Add GitHub secrets** (Settings → Secrets and variables → Actions):
-   - `CLOUDFLARE_API_TOKEN`
-   - `HERE_API_KEY`
-   - `SENTRY_DSN`
-   - `UPSTASH_REDIS_REST_URL`
-   - `UPSTASH_REDIS_REST_TOKEN`
+#### 1. Add GitHub secrets
 
-2. **Create and push a tag**:
+Go to your repo → Settings → Secrets and variables → Actions
+
+Add these secrets:
+
+- `CLOUDFLARE_API_TOKEN` - [Get from Cloudflare Dashboard](https://dash.cloudflare.com/profile/api-tokens)
+- `HERE_API_KEY` - Your HERE API key
+- `SENTRY_DSN` - Your Sentry DSN
+
+#### 2. Get Cloudflare API Token
+
+1. Go to [Cloudflare API Tokens](https://dash.cloudflare.com/profile/api-tokens)
+2. Click "Create Token"
+3. Use "Edit Cloudflare Workers" template
+4. Copy the token and add it to GitHub secrets as `CLOUDFLARE_API_TOKEN`
+
+#### 3. Deploy by pushing a tag
 
 ```bash
 git tag v1.0.0
 git push origin v1.0.0
 ```
 
-3. **Monitor deployment** in the Actions tab on GitHub
-
-### Get Cloudflare API Token
-
-1. Go to [Cloudflare API Tokens](https://dash.cloudflare.com/profile/api-tokens)
-2. Click "Create Token"
-3. Use "Edit Cloudflare Workers" template
-4. Copy the token and add it to GitHub secrets
+GitHub Actions will automatically deploy to Cloudflare Workers. Monitor deployment in the Actions tab.
 
 ## API Endpoints
 
@@ -136,6 +130,8 @@ curl "https://your-worker.workers.dev/autocomplete?q=Seattle&limit=5"
 - `in`: Geographic filter (e.g., `circle:47.6,-122.3;r=50000`)
 - All other [HERE Autocomplete API parameters](https://developer.here.com/documentation/geocoding-search-api/dev_guide/topics/endpoint-autocomplete-brief.html)
 
+**Note:** The `apiKey` parameter is automatically injected by the proxy. Any `apiKey` sent by the client will be removed.
+
 ### `/geocode`
 
 Proxies to HERE Geocode API.
@@ -151,6 +147,8 @@ curl "https://your-worker.workers.dev/geocode?q=1600+Amphitheatre+Parkway"
 - `q`: Address to geocode (required)
 - All other [HERE Geocode API parameters](https://developer.here.com/documentation/geocoding-search-api/dev_guide/topics/endpoint-geocode-brief.html)
 
+**Note:** The `apiKey` parameter is automatically injected by the proxy. Any `apiKey` sent by the client will be removed.
+
 ### `/health`
 
 Health check endpoint.
@@ -164,26 +162,22 @@ Health check endpoint.
 }
 ```
 
-## Rate Limiting
+## Error Responses
 
-- Limits are applied per client IP address
-- Uses token bucket algorithm via Upstash Redis
-- Default: 100 requests per hour
-- Rate limit info included in response headers:
-  - `X-RateLimit-Limit`: Total requests allowed
-  - `X-RateLimit-Remaining`: Requests remaining
-  - `X-RateLimit-Reset`: Unix timestamp when limit resets
-
-**Rate limit exceeded response (429):**
+All errors return JSON with an `error` field:
 
 ```json
 {
-  "error": "Rate limit exceeded",
-  "limit": 100,
-  "remaining": 0,
-  "resetAt": "2024-11-27T13:00:00.000Z"
+  "error": "Error message"
 }
 ```
+
+**HTTP Status Codes:**
+
+- `404` - Endpoint not found
+- `500` - Internal server error or proxy error
+
+All errors are automatically reported to Sentry with full context.
 
 ## Architecture
 
@@ -192,25 +186,33 @@ Client Request
     ↓
 Cloudflare Workers (Global Edge)
     ↓
-Rate Limiter (Upstash Redis)
-    ↓
 Hono Router
     ↓
-HERE API Proxy
+API Key Injection & Sanitization
+    ↓
+HERE API
     ↓
 Response to Client
+
+(Sentry monitors all errors)
 ```
 
 ## Tech Stack
 
-- **Runtime**: Cloudflare Workers
-- **Framework**: Hono
+- **Runtime**: Cloudflare Workers with `nodejs_compat`
+- **Framework**: [Hono](https://hono.dev/) - Lightweight, fast web framework
 - **Language**: TypeScript
 - **Package Manager**: Bun
-- **Rate Limiting**: Upstash Redis
-- **Monitoring**: Sentry
+- **Monitoring**: Sentry with automatic PII collection
 - **CI/CD**: GitHub Actions
+- **Wrangler**: v4.42.2
 
-## License
+## Development Notes
 
-MIT
+### Sentry Configuration
+
+The proxy uses `@sentry/cloudflare` with the official `withSentry` wrapper. Configuration includes:
+
+- `tracesSampleRate: 1.0` - Full trace sampling
+- `sendDefaultPii: true` - Automatic IP address collection for debugging
+- Automatic error capture for all exceptions
