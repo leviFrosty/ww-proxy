@@ -6,6 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 [observability]
 enabled = true
 head_sampling_rate = 1 # optional. default = 1.
+logs.persist = true
 
 # Secrets should be set via:
 # wrangler secret put HERE_API_KEY
