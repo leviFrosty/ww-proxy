@@ -46,10 +46,10 @@ The service will be available at `http://localhost:8787`
 
 ```bash
 # Autocomplete
-curl "http://localhost:8787/autocomplete?q=Seattle&limit=5"
+curl "http://localhost:8787/autocomplete?q=cincinnati&limit=5"
 
 # Geocode
-curl "http://localhost:8787/geocode?q=1600+Amphitheatre+Parkway,+Mountain+View,+CA"
+curl "http://localhost:8787/geocode?q=48 Muir+Rd,+Rogers,+KY+41365"
 
 # Health check
 curl "http://localhost:8787/health"
