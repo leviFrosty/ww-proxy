@@ -7,7 +7,7 @@ A lightweight Cloudflare Workers proxy service for HERE API endpoints with Sentr
 - [Bun](https://bun.sh/) installed
 - [Cloudflare account](https://dash.cloudflare.com/sign-up/workers-and-pages)
 - [HERE API key](https://developer.here.com/)
-- [Sentry account](https://sentry.io/) (optional but recommended)
+- [Sentry account](https://sentry.io/) (optional but recommended for error logging)
 
 ## Setup
 
@@ -128,7 +128,7 @@ curl "https://your-worker.workers.dev/autocomplete?q=Seattle&limit=5"
 - `q`: Search query (required)
 - `limit`: Max number of suggestions
 - `in`: Geographic filter (e.g., `circle:47.6,-122.3;r=50000`)
-- All other [HERE Autocomplete API parameters](https://developer.here.com/documentation/geocoding-search-api/dev_guide/topics/endpoint-autocomplete-brief.html)
+- All other [HERE Autocomplete API parameters and docs](https://www.here.com/docs/bundle/geocoding-and-search-api-developer-guide/page/topics/endpoint-autocomplete-brief.html)
 
 **Note:** The `apiKey` parameter is automatically injected by the proxy. Any `apiKey` sent by the client will be removed.
 
@@ -145,7 +145,7 @@ curl "https://your-worker.workers.dev/geocode?q=1600+Amphitheatre+Parkway"
 **Query parameters:**
 
 - `q`: Address to geocode (required)
-- All other [HERE Geocode API parameters](https://developer.here.com/documentation/geocoding-search-api/dev_guide/topics/endpoint-geocode-brief.html)
+- All other [HERE Geocode API parameters and docs](https://www.here.com/docs/bundle/geocoding-and-search-api-developer-guide/page/topics-api/code-geocode-address.html)
 
 **Note:** The `apiKey` parameter is automatically injected by the proxy. Any `apiKey` sent by the client will be removed.
 
@@ -172,11 +172,6 @@ All errors return JSON with an `error` field:
 }
 ```
 
-**HTTP Status Codes:**
-
-- `404` - Endpoint not found
-- `500` - Internal server error or proxy error
-
 All errors are automatically reported to Sentry with full context.
 
 ## Architecture
@@ -197,22 +192,11 @@ Response to Client
 (Sentry monitors all errors)
 ```
 
-## Tech Stack
+## Stack
 
 - **Runtime**: Cloudflare Workers with `nodejs_compat`
-- **Framework**: [Hono](https://hono.dev/) - Lightweight, fast web framework
+- **Framework**: [Hono](https://hono.dev/)
 - **Language**: TypeScript
 - **Package Manager**: Bun
-- **Monitoring**: Sentry with automatic PII collection
-- **CI/CD**: GitHub Actions
+- **Monitoring**: Sentry
 - **Wrangler**: v4.42.2
-
-## Development Notes
-
-### Sentry Configuration
-
-The proxy uses `@sentry/cloudflare` with the official `withSentry` wrapper. Configuration includes:
-
-- `tracesSampleRate: 1.0` - Full trace sampling
-- `sendDefaultPii: true` - Automatic IP address collection for debugging
-- Automatic error capture for all exceptions
