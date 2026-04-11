@@ -48,4 +48,4 @@ jobs:
       - name: Post-deployment health check
         run: |
           sleep 5
-          curl -f https://ww-proxy.levi-wilkerson.workers.dev/health || exit 1
+          curl -f https://ww-proxy.leviwilkerson.com/health || exit 1
