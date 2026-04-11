@@ -9,6 +9,10 @@ preview_urls = false
 pattern = "ww-proxy.leviwilkerson.com"
 custom_domain = true
 
+[vars]
+APP_VERSION = "dev"
+COMMIT_SHA = "local"
+
 [[ratelimits]]
 name = "RATE_LIMITER"
 namespace_id = "1001"
