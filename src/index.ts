@@ -35,6 +35,8 @@ function handleHealthCheckRequest(context: AppContext) {
   const response: HealthCheckResponse = {
     status: "ok",
     timestamp: new Date().toISOString(),
+    version: context.env.APP_VERSION,
+    commit: context.env.COMMIT_SHA,
   };
   return context.json(response);
 }

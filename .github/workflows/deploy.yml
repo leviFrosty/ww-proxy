@@ -21,6 +21,12 @@ jobs:
       - name: Install dependencies
         run: bun install
 
+      - name: Compute build metadata
+        id: meta
+        run: |
+          echo "version=$(jq -r .version package.json)" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Deploy to Cloudflare Workers
         uses: cloudflare/wrangler-action@v3
         with:
@@ -30,9 +36,14 @@ jobs:
           secrets: |
             HERE_API_KEY
             SENTRY_DSN
+          vars: |
+            APP_VERSION
+            COMMIT_SHA
         env:
           HERE_API_KEY: ${{ secrets.HERE_API_KEY }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          APP_VERSION: ${{ steps.meta.outputs.version }}
+          COMMIT_SHA: ${{ steps.meta.outputs.commit }}
 
       - name: Post-deployment health check
         run: |
