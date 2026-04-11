@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import type { MiddlewareHandler } from "hono";
 import type {
   Environment,
   AppContext,
@@ -10,6 +11,17 @@ import { proxyRequestToHereApi } from "./proxy";
 import { Sentry, createSentryConfig } from "./sentry";
 
 const app = new Hono<{ Bindings: Environment }>();
+
+const rateLimitMiddleware: MiddlewareHandler<{ Bindings: Environment }> =
+  async (context, next) => {
+    const clientIp = context.req.header("CF-Connecting-IP") ?? "unknown";
+    const { success } = await context.env.RATE_LIMITER.limit({ key: clientIp });
+    if (!success) {
+      const response: ErrorResponse = { error: "Rate limit exceeded" };
+      return context.json(response, HTTP_STATUS.TOO_MANY_REQUESTS);
+    }
+    await next();
+  };
 
 async function handleGeocodeRequest(context: AppContext) {
   return proxyRequestToHereApi(context, HERE_API.GEOCODE_URL);
@@ -39,6 +51,9 @@ function handleApplicationError(error: Error, context: AppContext) {
   const response: ErrorResponse = { error: "Internal server error" };
   return context.json(response, HTTP_STATUS.INTERNAL_SERVER_ERROR);
 }
+
+app.use("/geocode", rateLimitMiddleware);
+app.use("/autocomplete", rateLimitMiddleware);
 
 app.get("/geocode", handleGeocodeRequest);
 app.get("/autocomplete", handleAutocompleteRequest);
