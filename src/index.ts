@@ -8,6 +8,7 @@ import type {
 } from "./types";
 import { HERE_API, HTTP_STATUS } from "./config";
 import { proxyRequestToHereApi } from "./proxy";
+import { handleAasaRequest, handleContactLinkRequest } from "./contactLink";
 import { Sentry, createSentryConfig } from "./sentry";
 
 const app = new Hono<{ Bindings: Environment }>();
@@ -60,6 +61,10 @@ app.use("/autocomplete", rateLimitMiddleware);
 app.get("/geocode", handleGeocodeRequest);
 app.get("/autocomplete", handleAutocompleteRequest);
 app.get("/health", handleHealthCheckRequest);
+// Universal-link support for WitnessWork contact sharing. AASA must be served
+// at this exact path with Content-Type application/json and no redirects.
+app.get("/.well-known/apple-app-site-association", handleAasaRequest);
+app.get("/c/:payload", handleContactLinkRequest);
 app.notFound(handleNotFound);
 app.onError(handleApplicationError);
 

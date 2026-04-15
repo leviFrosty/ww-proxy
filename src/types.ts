@@ -5,6 +5,11 @@ export interface Environment {
   SENTRY_DSN: string;
   APP_VERSION: string;
   COMMIT_SHA: string;
+  /**
+   * Apple Developer Team ID. Injected into the AASA response so iOS can
+   * verify that the declared bundle IDs belong to this team.
+   */
+  APPLE_TEAM_ID: string;
   RATE_LIMITER: RateLimit;
 }
 

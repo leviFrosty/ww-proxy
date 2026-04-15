@@ -5,6 +5,14 @@ compatibility_flags = ["nodejs_compat"]
 workers_dev = false
 preview_urls = false
 
+# Static assets (og-image, apple-touch-icon) served directly by Cloudflare's
+# edge cache. Requests to paths matching files under `./public` are served
+# from the edge; unmatched paths fall through to the worker (default
+# behavior when `main` is set and `not_found_handling` is omitted).
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
 [[routes]]
 pattern = "ww-proxy.leviwilkerson.com"
 custom_domain = true

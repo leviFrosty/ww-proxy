@@ -6,3 +6,8 @@ HERE_API_KEY=your_here_api_key_here
 
 # Sentry DSN from https://sentry.io/
 SENTRY_DSN=https://your-sentry-dsn@sentry.io/project-id
+
+# Apple Developer Team ID (10-character string) — used by the AASA endpoint
+# for iOS universal links. Same value as APPLE_TEAM_ID in the witness-work
+# Expo app config.
+APPLE_TEAM_ID=YOUR_TEAM_ID_HERE

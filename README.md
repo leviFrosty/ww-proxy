@@ -149,6 +149,23 @@ curl "https://your-worker.workers.dev/geocode?q=1600+Amphitheatre+Parkway"
 
 **Note:** The `apiKey` parameter is automatically injected by the proxy. Any `apiKey` sent by the client will be removed.
 
+### `/.well-known/apple-app-site-association`
+
+Serves the AASA JSON used by iOS to validate universal links for contact
+sharing. Lists both dev (`com.leviwilkerson.jwtimedev`) and prod
+(`com.leviwilkerson.jwtime`) bundle IDs, prefixed with `APPLE_TEAM_ID`.
+
+Matches any URL under `/c/*`.
+
+### `/c/:payload`
+
+Universal-link landing page for shared WitnessWork contacts. iOS hands the
+request off to the WitnessWork app when installed; otherwise this endpoint
+serves a fallback HTML page with an App Store CTA.
+
+The `payload` segment is an opaque gzip + base64url–encoded contact export
+produced by the app — the worker never decodes it.
+
 ### `/health`
 
 Health check endpoint.

@@ -1,6 +1,6 @@
 {
   "name": "ww-proxy",
-  "version": "1.0.5",
+  "version": "1.1.0",
   "description": "HERE API proxy for Cloudflare Workers",
   "main": "src/index.ts",
   "scripts": {
