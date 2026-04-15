@@ -1,6 +1,6 @@
-# WW Proxy
+# WW API
 
-A lightweight Cloudflare Workers proxy service for HERE API endpoints with Sentry monitoring. Protects your HERE API key from client-side exposure while providing global edge performance.
+A lightweight Cloudflare Workers api and proxy service for HERE API endpoints, iOS universal links, etc. with Sentry monitoring.
 
 ## Prerequisites
 
