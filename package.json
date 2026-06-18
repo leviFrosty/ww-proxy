@@ -6,11 +6,17 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "test": "bun test"
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@ai-sdk/gateway": "^3.0.133",
+    "@peculiar/x509": "^2.0.0",
+    "@sentry/cloudflare": "^8.55.1",
+    "ai": "^6.0.208",
+    "cbor2": "^2.3.0",
     "hono": "^4.12.12",
-    "@sentry/cloudflare": "^8.55.1"
+    "reflect-metadata": "^0.2.2"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260411.1",

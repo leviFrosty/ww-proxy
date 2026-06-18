@@ -8,6 +8,20 @@ HERE_API_KEY=your_here_api_key_here
 SENTRY_DSN=https://your-sentry-dsn@sentry.io/project-id
 
 # Apple Developer Team ID (10-character string) — used by the AASA endpoint
-# for iOS universal links. Same value as APPLE_TEAM_ID in the witness-work
-# Expo app config.
+# for iOS universal links AND as the App Attest app-id prefix. Same value as
+# APPLE_TEAM_ID in the witness-work Expo app config.
 APPLE_TEAM_ID=YOUR_TEAM_ID_HERE
+
+# --- Notes Import ---------------------------------------------------------
+
+# Vercel AI Gateway API key (reaches the ZDR inference host). Create at
+# https://vercel.com/dashboard → AI Gateway → API Keys.
+AI_GATEWAY_API_KEY=your_ai_gateway_key_here
+
+# RevenueCat REST v1 SECRET key (sk_...) for server-side Supporter checks.
+# Project → API keys → Secret keys. NEVER ship this in the app.
+REVENUECAT_API_KEY=sk_your_revenuecat_secret_here
+
+# Local dev only: lets the iOS simulator (no Secure Enclave) skip App Attest by
+# sending header `x-ww-dev-bypass: <this value>`. Leave UNSET in production.
+NOTES_IMPORT_DEV_BYPASS_TOKEN=local-dev-bypass

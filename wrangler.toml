@@ -20,6 +20,25 @@ custom_domain = true
 [vars]
 APP_VERSION = "dev"
 COMMIT_SHA = "local"
+# iOS bundle id — part of the App Attest app id (`<APPLE_TEAM_ID>.<IOS_BUNDLE_ID>`).
+IOS_BUNDLE_ID = "com.leviwilkerson.jwtime"
+# RevenueCat entitlement that denotes a Supporter (server-side check).
+REVENUECAT_ENTITLEMENT_ID = "Supporter"
+# Notes Import knobs — all optional; see src/notesImport/config.ts for defaults.
+# NOTES_IMPORT_MODEL = "deepseek/deepseek-v4-flash"
+# NOTES_IMPORT_PROVIDERS = "fireworks,deepinfra,baseten,azure"
+# NOTES_IMPORT_MAX_CHARS = "100000"
+# NOTES_IMPORT_MAX_OUTPUT_TOKENS = "16000"
+# NOTES_IMPORT_FREE_CREDITS = "5"
+# NOTES_IMPORT_MAX_REFINEMENTS = "5"
+
+# Notes Import metadata store (challenges, device keys, usage counters). Holds
+# NO notes text or model output (ADR 0008). Create with:
+#   wrangler kv namespace create NOTES_KV
+# then paste the printed id below.
+[[kv_namespaces]]
+binding = "NOTES_KV"
+id = "REPLACE_WITH_NOTES_KV_NAMESPACE_ID"
 
 [[ratelimits]]
 name = "RATE_LIMITER"
@@ -37,3 +56,6 @@ logs.persist = true
 # Secrets should be set via:
 # wrangler secret put HERE_API_KEY
 # wrangler secret put SENTRY_DSN
+# wrangler secret put AI_GATEWAY_API_KEY        # Vercel AI Gateway key (ZDR host)
+# wrangler secret put REVENUECAT_API_KEY        # RevenueCat REST v1 secret (sk_...)
+# wrangler secret put NOTES_IMPORT_DEV_BYPASS_TOKEN   # DEV/STAGING worker only — never prod

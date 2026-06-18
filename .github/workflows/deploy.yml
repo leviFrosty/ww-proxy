@@ -36,12 +36,16 @@ jobs:
           secrets: |
             HERE_API_KEY
             SENTRY_DSN
+            AI_GATEWAY_API_KEY
+            REVENUECAT_API_KEY
           vars: |
             APP_VERSION
             COMMIT_SHA
         env:
           HERE_API_KEY: ${{ secrets.HERE_API_KEY }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
+          REVENUECAT_API_KEY: ${{ secrets.REVENUECAT_API_KEY }}
           APP_VERSION: ${{ steps.meta.outputs.version }}
           COMMIT_SHA: ${{ steps.meta.outputs.commit }}
 
