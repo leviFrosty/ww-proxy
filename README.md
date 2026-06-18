@@ -166,6 +166,43 @@ serves a fallback HTML page with an App Store CTA.
 The `payload` segment is an opaque gzip + base64url–encoded contact export
 produced by the app — the worker never decodes it.
 
+### Notes Import (`/notes-import*`)
+
+LLM-backed parsing of free-form ministry notes into structured WitnessWork
+records. The proxy owns the prompt + JSON schema, calls the model through the
+Vercel AI Gateway pinned to a Western zero-data-retention host (ADR 0008), and
+meters free usage. It persists **only** counters and device keys in KV — never
+notes text or model output.
+
+Three routes (all rate-limited, all `POST`):
+
+- **`/notes-import/challenge`** → `{ challenge }`. One-time App Attest nonce.
+- **`/notes-import/attest`** `{ keyId, attestation, challenge, uuid }` → `{ ok }`.
+  The App Attest handshake; verifies the attestation and stores the device's
+  public key pinned to the Keychain `uuid` (ADR 0007).
+- **`/notes-import`** `{ uuid, notesText, contentHash, context, keyId, challenge,
+  assertion, refinement? }` → `{ result, contentHash, refinement, credits }`.
+  Verifies the per-request App Attest assertion (the security boundary), checks
+  Supporter status via RevenueCat + the free-credit cap, then runs the model.
+
+Auth is enforced by Apple **App Attest** on every call. A dev/staging worker may
+set `NOTES_IMPORT_DEV_BYPASS_TOKEN` so the iOS simulator can send
+`x-ww-dev-bypass: <token>` to skip attestation. **Never set it in production.**
+
+**One-time setup** (beyond HERE/Sentry):
+
+```bash
+# KV namespace for challenges, device keys, and usage counters
+bunx wrangler kv namespace create NOTES_KV
+# → paste the printed id into wrangler.toml [[kv_namespaces]] id
+
+bunx wrangler secret put AI_GATEWAY_API_KEY   # Vercel AI Gateway key
+bunx wrangler secret put REVENUECAT_API_KEY   # RevenueCat REST v1 secret (sk_...)
+```
+
+All Notes Import limits (model, provider allowlist, char ceiling, free credits,
+refinement cap) are env-overridable — see `src/notesImport/config.ts`.
+
 ### `/health`
 
 Health check endpoint.

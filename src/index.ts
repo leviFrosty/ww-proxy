@@ -9,6 +9,11 @@ import type {
 import { HERE_API, HTTP_STATUS } from "./config";
 import { proxyRequestToHereApi } from "./proxy";
 import { handleAasaRequest, handleContactLinkRequest } from "./contactLink";
+import {
+  handleChallengeRequest,
+  handleAttestRequest,
+  handleNotesImportRequest,
+} from "./notesImport/route";
 import { Sentry, createSentryConfig } from "./sentry";
 
 const app = new Hono<{ Bindings: Environment }>();
@@ -57,10 +62,16 @@ function handleApplicationError(error: Error, context: AppContext) {
 
 app.use("/geocode", rateLimitMiddleware);
 app.use("/autocomplete", rateLimitMiddleware);
+app.use("/notes-import", rateLimitMiddleware);
+app.use("/notes-import/*", rateLimitMiddleware);
 
 app.get("/geocode", handleGeocodeRequest);
 app.get("/autocomplete", handleAutocompleteRequest);
 app.get("/health", handleHealthCheckRequest);
+// Notes Import: App Attest handshake + the metered, attested model call.
+app.post("/notes-import/challenge", handleChallengeRequest);
+app.post("/notes-import/attest", handleAttestRequest);
+app.post("/notes-import", handleNotesImportRequest);
 // Universal-link support for WitnessWork contact sharing. AASA must be served
 // at this exact path with Content-Type application/json and no redirects.
 app.get("/.well-known/apple-app-site-association", handleAasaRequest);
