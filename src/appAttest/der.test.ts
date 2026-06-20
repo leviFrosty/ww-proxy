@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it } from 'vitest'
 import { extractAttestationNonce, derEcdsaSignatureToRaw, DerError } from './der'
 
 const seq = (children: number[]): number[] => [0x30, children.length, ...children]

@@ -10,7 +10,7 @@ import { consumeChallenge } from './challenge'
 import { AppAttestError } from './errors'
 import { putKeyRecord, type AppAttestKv } from './keyStore'
 
-// @peculiar/x509 needs a WebCrypto implementation; the Workers/Bun global works.
+// @peculiar/x509 needs a WebCrypto implementation; the Workers global works.
 cryptoProvider.set(crypto as Crypto)
 
 const APPLE_APP_ATTEST_OID = '1.2.840.113635.100.8.2'

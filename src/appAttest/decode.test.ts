@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it } from 'vitest'
 import { encode } from 'cbor2'
 import {
   decodeAttestation,

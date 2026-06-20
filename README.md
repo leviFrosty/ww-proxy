@@ -4,7 +4,7 @@ A lightweight Cloudflare Workers api and proxy service for HERE API endpoints, i
 
 ## Prerequisites
 
-- [Bun](https://bun.sh/) installed
+- [pnpm](https://pnpm.io/) installed
 - [Cloudflare account](https://dash.cloudflare.com/sign-up/workers-and-pages)
 - [HERE API key](https://developer.here.com/)
 - [Sentry account](https://sentry.io/) (optional but recommended for error logging)
@@ -14,7 +14,7 @@ A lightweight Cloudflare Workers api and proxy service for HERE API endpoints, i
 ### 1. Install dependencies
 
 ```bash
-bun install
+pnpm install
 ```
 
 ### 2. Configure environment variables
@@ -37,7 +37,7 @@ SENTRY_DSN=https://your-sentry-dsn@sentry.io/project-id
 Run the development server:
 
 ```bash
-bun run dev
+pnpm run dev
 ```
 
 The service will be available at `http://localhost:8787`
@@ -62,23 +62,23 @@ curl "http://localhost:8787/health"
 Set secrets (one-time setup):
 
 ```bash
-bunx wrangler secret put HERE_API_KEY
+pnpm exec wrangler secret put HERE_API_KEY
 # Paste your HERE API key when prompted
 
-bunx wrangler secret put SENTRY_DSN
+pnpm exec wrangler secret put SENTRY_DSN
 # Paste your Sentry DSN when prompted
 ```
 
 Verify secrets are set:
 
 ```bash
-bunx wrangler secret list
+pnpm exec wrangler secret list
 ```
 
 Deploy to Cloudflare Workers:
 
 ```bash
-bun run deploy
+pnpm run deploy
 ```
 
 ### Automatic deployment via GitHub Actions
@@ -193,11 +193,11 @@ set `NOTES_IMPORT_DEV_BYPASS_TOKEN` so the iOS simulator can send
 
 ```bash
 # KV namespace for challenges, device keys, and usage counters
-bunx wrangler kv namespace create NOTES_KV
+pnpm exec wrangler kv namespace create NOTES_KV
 # → paste the printed id into wrangler.toml [[kv_namespaces]] id
 
-bunx wrangler secret put AI_GATEWAY_API_KEY   # Vercel AI Gateway key
-bunx wrangler secret put REVENUECAT_API_KEY   # RevenueCat REST v1 secret (sk_...)
+pnpm exec wrangler secret put AI_GATEWAY_API_KEY   # Vercel AI Gateway key
+pnpm exec wrangler secret put REVENUECAT_API_KEY   # RevenueCat REST v1 secret (sk_...)
 ```
 
 All Notes Import limits (model, provider allowlist, char ceiling, free credits,
@@ -251,6 +251,6 @@ Response to Client
 - **Runtime**: Cloudflare Workers with `nodejs_compat`
 - **Framework**: [Hono](https://hono.dev/)
 - **Language**: TypeScript
-- **Package Manager**: Bun
+- **Package Manager**: pnpm
 - **Monitoring**: Sentry
 - **Wrangler**: v4.42.2

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it } from 'vitest'
 import { isSupporter, RevenueCatError } from './revenuecat'
 
 const NOW = Date.parse('2026-06-18T00:00:00Z')
