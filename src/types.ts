@@ -3,8 +3,13 @@ import type { Context } from 'hono';
 export interface Environment {
   HERE_API_KEY: string;
   SENTRY_DSN: string;
-  APP_VERSION: string;
-  COMMIT_SHA: string;
+  /**
+   * Worker Version Metadata binding. Cloudflare populates this at runtime with
+   * the deployed version's `id`/`tag`/`timestamp`, so `/health` can report the
+   * actual deployed build instead of a stale plaintext var. Configured under
+   * `[version_metadata]` in wrangler.toml (repeated for `[env.dev]`).
+   */
+  CF_VERSION_METADATA: WorkerVersionMetadata;
   /**
    * Apple Developer Team ID. Injected into the AASA response so iOS can
    * verify that the declared bundle IDs belong to this team. Also the App ID
@@ -68,9 +73,14 @@ export type AppContext = Context<{ Bindings: Environment }>;
 
 export interface HealthCheckResponse {
   status: 'ok';
+  /** Current server time (request handling time). */
   timestamp: string;
-  version: string;
-  commit: string;
+  /** Deployed Worker version id (from the version_metadata binding). */
+  versionId: string;
+  /** Optional version tag, if one was set at upload (`wrangler versions upload --tag`). */
+  versionTag?: string;
+  /** ISO timestamp of when this Worker version was uploaded (from version_metadata). */
+  deployedAt: string;
 }
 
 export interface ErrorResponse {

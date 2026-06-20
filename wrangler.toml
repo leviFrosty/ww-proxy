@@ -17,9 +17,64 @@ binding = "ASSETS"
 pattern = "ww-proxy.leviwilkerson.com"
 custom_domain = true
 
+# Exposes the deployed Worker version (id/tag/timestamp) to the runtime so
+# /health can report the actual build. NOT inherited by named envs — repeated
+# under [env.dev.version_metadata] below.
+[version_metadata]
+binding = "CF_VERSION_METADATA"
+
+# --- Dev / staging worker -----------------------------------------------------
+# A fully separate Worker (`ww-proxy-dev`) for real-device App Attest testing.
+# Deploy with `wrangler deploy --env dev` — it can never overwrite prod.
+# In Wrangler, `vars`, `kv_namespaces`, and `ratelimits` are NOT inherited by a
+# named env, so they're repeated below. See AGENTS.md for the full runbook.
+[env.dev]
+name = "ww-proxy-dev"
+workers_dev = true   # public https://ww-proxy-dev.<subdomain>.workers.dev (device-reachable)
+preview_urls = true
+# Routes ARE inherited by named envs (unlike vars/kv/ratelimits), so without this
+# dev would inherit prod's [[routes]] custom domain and try to steal
+# ww-proxy.leviwilkerson.com on deploy. Empty list = workers.dev URL only.
+routes = []
+
+[env.dev.version_metadata]
+binding = "CF_VERSION_METADATA"
+
+[env.dev.vars]
+# Dev iOS bundle id (witness-work app.config.ts IS_DEV branch).
+IOS_BUNDLE_ID = "com.leviwilkerson.jwtimedev"
+REVENUECAT_ENTITLEMENT_ID = "Supporter"
+
+# Separate KV so dev never shares prod's credit counters / device keys.
+# Create with: wrangler kv namespace create NOTES_KV --env dev
+# then paste the printed id below.
+[[env.dev.kv_namespaces]]
+binding = "NOTES_KV"
+id = "9a9f6d4e4ce3441fb8322aadf19d4904"
+
+[[env.dev.ratelimits]]
+name = "RATE_LIMITER"
+namespace_id = "2001"   # distinct from prod's 1001
+
+  [env.dev.ratelimits.simple]
+  limit = 60
+  period = 60
+
+# Cloudflare Workers Observability — not inherited, so repeated for dev.
+# Full sampling on dev to capture everything while iterating.
+[env.dev.observability]
+enabled = true
+head_sampling_rate = 1
+
+  [env.dev.observability.logs]
+  enabled = true
+  invocation_logs = true
+
+  [env.dev.observability.traces]
+  enabled = true
+  head_sampling_rate = 1
+
 [vars]
-APP_VERSION = "dev"
-COMMIT_SHA = "local"
 # iOS bundle id — part of the App Attest app id (`<APPLE_TEAM_ID>.<IOS_BUNDLE_ID>`).
 IOS_BUNDLE_ID = "com.leviwilkerson.jwtime"
 # RevenueCat entitlement that denotes a Supporter (server-side check).
@@ -38,7 +93,7 @@ REVENUECAT_ENTITLEMENT_ID = "Supporter"
 # then paste the printed id below.
 [[kv_namespaces]]
 binding = "NOTES_KV"
-id = "REPLACE_WITH_NOTES_KV_NAMESPACE_ID"
+id = "92871586e6dc4558a6ad3552ed7ee28c"
 
 [[ratelimits]]
 name = "RATE_LIMITER"
