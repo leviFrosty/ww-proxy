@@ -13,8 +13,19 @@ import {
   handleChallengeRequest,
   handleAttestRequest,
   handleNotesImportRequest,
+  handleNotesImportStatusRequest,
+  handleNotesImportKickoffRequest,
+  handleNotesImportEventsRequest,
+  handleNotesImportResultRequest,
+  handleNotesImportCancelRequest,
+  handleNotesImportDestroyRequest,
 } from "./notesImport/route";
 import { Sentry, createSentryConfig } from "./sentry";
+
+// Durable Object classes must be re-exported from the entry module so Wrangler
+// can bind them (see wrangler.toml [[durable_objects.bindings]] + migrations).
+export { NotesImportRun } from "./notesImport/runDO";
+export { NotesImportIndex } from "./notesImport/indexDO";
 
 const app = new Hono<{ Bindings: Environment }>();
 
@@ -69,9 +80,17 @@ app.use("/notes-import/*", rateLimitMiddleware);
 app.get("/geocode", handleGeocodeRequest);
 app.get("/autocomplete", handleAutocompleteRequest);
 app.get("/health", handleHealthCheckRequest);
-// Notes Import: App Attest handshake + the metered, attested model call.
+// Notes Import: availability probe, App Attest handshake + the metered call.
+app.get("/notes-import/status", handleNotesImportStatusRequest);
 app.post("/notes-import/challenge", handleChallengeRequest);
 app.post("/notes-import/attest", handleAttestRequest);
+// Streaming import: attested kickoff → SSE progress stream → result snapshot.
+app.post("/notes-import/kickoff", handleNotesImportKickoffRequest);
+app.get("/notes-import/:importId/events", handleNotesImportEventsRequest);
+app.get("/notes-import/:importId/result", handleNotesImportResultRequest);
+app.post("/notes-import/:importId/cancel", handleNotesImportCancelRequest);
+app.post("/notes-import/:importId/destroy", handleNotesImportDestroyRequest);
+// Legacy synchronous path (fallback during cutover).
 app.post("/notes-import", handleNotesImportRequest);
 // Universal-link support for WitnessWork contact sharing. AASA must be served
 // at this exact path with Content-Type application/json and no redirects.

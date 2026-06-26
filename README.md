@@ -169,10 +169,13 @@ produced by the app — the worker never decodes it.
 ### Notes Import (`/notes-import*`)
 
 LLM-backed parsing of free-form ministry notes into structured WitnessWork
-records. The proxy owns the prompt + JSON schema, calls the model through the
-Vercel AI Gateway pinned to a Western zero-data-retention host (ADR 0008), and
-meters free usage. It persists **only** counters and device keys in KV — never
-notes text or model output.
+records. The proxy owns the prompt + JSON schema, calls the model through
+OpenRouter with routing pinned ZDR-only (`zdr: true` + `data_collection: 'deny'`,
+restricted to a vetted Western provider allowlist) so the request can only reach
+a zero-data-retention host that never trains on or stores it — failing rather
+than ever downgrading to a data-retaining provider (ADR 0008). It meters free
+usage and persists **only** counters and device keys in KV — never notes text or
+model output.
 
 Three routes (all rate-limited, all `POST`):
 
@@ -181,13 +184,16 @@ Three routes (all rate-limited, all `POST`):
   The App Attest handshake; verifies the attestation and stores the device's
   public key pinned to the Keychain `uuid` (ADR 0007).
 - **`/notes-import`** `{ uuid, notesText, contentHash, context, keyId, challenge,
-  assertion, refinement? }` → `{ result, contentHash, refinement, credits }`.
+  assertion, refinement? }` → `{ result, contentHash, refinement, credits }`,
+  where `credits` includes the import and per-source refinement allowances.
   Verifies the per-request App Attest assertion (the security boundary), checks
   Supporter status via RevenueCat + the free-credit cap, then runs the model.
 
 Auth is enforced by Apple **App Attest** on every call. A dev/staging worker may
 set `NOTES_IMPORT_DEV_BYPASS_TOKEN` so the iOS simulator can send
-`x-ww-dev-bypass: <token>` to skip attestation. **Never set it in production.**
+`x-ww-dev-bypass: <token>` to skip attestation and import-credit metering during
+development. The per-source refinement safety cap still applies. **Never set
+this token in production.**
 
 **One-time setup** (beyond HERE/Sentry):
 
@@ -196,7 +202,7 @@ set `NOTES_IMPORT_DEV_BYPASS_TOKEN` so the iOS simulator can send
 pnpm exec wrangler kv namespace create NOTES_KV
 # → paste the printed id into wrangler.toml [[kv_namespaces]] id
 
-pnpm exec wrangler secret put AI_GATEWAY_API_KEY   # Vercel AI Gateway key
+pnpm exec wrangler secret put OPENROUTER_API_KEY   # OpenRouter key (routed ZDR-only)
 pnpm exec wrangler secret put REVENUECAT_API_KEY   # RevenueCat REST v1 secret (sk_...)
 ```
 

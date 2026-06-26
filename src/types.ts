@@ -27,8 +27,24 @@ export interface Environment {
    */
   NOTES_KV: KVNamespace;
 
-  /** Vercel AI Gateway API key (secret). Reaches the ZDR inference host. */
-  AI_GATEWAY_API_KEY: string;
+  /**
+   * Per-import Durable Object: runs the streaming model call in the background
+   * and streams progress to the client over SSE (one instance per importId).
+   */
+  NOTES_IMPORT_RUN: DurableObjectNamespace<
+    import('./notesImport/runDO').NotesImportRun
+  >;
+
+  /**
+   * Per-user Durable Object: enforces the N-concurrent-imports cap and backs the
+   * app's active-imports list (one instance per install uuid).
+   */
+  NOTES_IMPORT_INDEX: DurableObjectNamespace<
+    import('./notesImport/indexDO').NotesImportIndex
+  >;
+
+  /** OpenRouter API key (secret). Routed ZDR-only to the inference host. */
+  OPENROUTER_API_KEY: string;
 
   /** RevenueCat REST v1 secret key (`sk_...`) for server-side supporter checks (secret). */
   REVENUECAT_API_KEY: string;
@@ -43,9 +59,12 @@ export interface Environment {
   NOTES_IMPORT_MODEL?: string;
 
   /**
-   * Comma-separated Vercel AI Gateway provider allowlist (the `only` filter).
-   * Pins inference to vetted Western ZDR hosts. Default
-   * `fireworks,deepinfra,baseten,azure`.
+   * Comma-separated OpenRouter provider allowlist, in routing-priority order
+   * (drives both `only` and `order`). Pins inference to vetted **Western** ZDR
+   * hosts (ADR 0008) — keep it Western-only; `zdr: true` enforces retention
+   * separately. Default `fireworks,digitalocean` (Fireworks preferred for
+   * genuine reasoning, DigitalOcean the large 429 fallback; DeepInfra excluded —
+   * mislabels reasoning).
    */
   NOTES_IMPORT_PROVIDERS?: string;
 
@@ -60,6 +79,28 @@ export interface Environment {
 
   /** Max stateless follow-up refinements per content hash. Default 5. */
   NOTES_IMPORT_MAX_REFINEMENTS?: string;
+
+  /** Max concurrent in-flight imports per identity (non-Supporter). Default 2. */
+  NOTES_IMPORT_ACTIVE_CAP?: string;
+
+  /** Max concurrent in-flight imports per identity (Supporter). Default 5. */
+  NOTES_IMPORT_ACTIVE_CAP_SUPPORTER?: string;
+
+  /** Seconds a finished import's result is retained for reconnect. Default 3600. */
+  NOTES_IMPORT_RESULT_RETENTION_SECONDS?: string;
+
+  /** TTL of a subscribe capability token. Default 3600. */
+  NOTES_IMPORT_SUBSCRIBE_TOKEN_TTL_SECONDS?: string;
+
+  /**
+   * OpenRouter reasoning effort. For `deepseek-v4-flash` only `high` and `xhigh`
+   * are valid; `xhigh` is the model's max ("Think Max"). DEFAULT `xhigh`. `max`
+   * is accepted here but coerced to `xhigh` (raw `max` is invalid on OpenRouter
+   * and silently degrades). `off`/`none`/empty disables. The model co-emits
+   * reasoning + strict structured output; a buggy ZDR host's parser may misroute
+   * the JSON into the reasoning channel, which the run DO recovers.
+   */
+  NOTES_IMPORT_REASONING_EFFORT?: string;
 
   /**
    * When set, a request carrying header `x-ww-dev-bypass: <this value>` skips
@@ -87,4 +128,10 @@ export interface ErrorResponse {
   error: string;
   /** Stable machine-readable code so the app can branch (e.g. show the paywall). */
   code?: string;
+  /**
+   * Underlying error detail, surfaced ONLY to dev-bypass callers (i.e. DEV app
+   * builds) so the real cause of an otherwise-opaque failure (e.g. `model_error`)
+   * is visible on-device. Never populated for attested production requests.
+   */
+  detail?: string;
 }

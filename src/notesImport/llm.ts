@@ -1,5 +1,11 @@
-import { generateObject, jsonSchema, type JSONSchema7 } from 'ai'
-import { createGateway } from '@ai-sdk/gateway'
+import {
+  streamText,
+  Output,
+  jsonSchema,
+  type JSONSchema7,
+  type LanguageModelUsage,
+} from 'ai'
+import { createOpenRouter } from '@openrouter/ai-sdk-provider'
 import { buildNotesImportSystemPrompt } from './prompt'
 import {
   NOTES_IMPORT_SCHEMA,
@@ -15,6 +21,17 @@ export interface RefinementInput {
   instruction: string
 }
 
+/**
+ * A best-effort signal emitted WHILE the model streams, purely so the client can
+ * show that work is happening. Never affects the returned result — the
+ * structured object always comes from `result.output`, never assembled from
+ * these deltas (see ADR / docs/notes-import-streaming-durable-objects.md).
+ */
+export type ModelProgress =
+  | { kind: 'phase'; phase: 'starting' | 'thinking' | 'structuring' }
+  | { kind: 'reasoning'; text: string }
+  | { kind: 'progress'; chars: number }
+
 export interface RunModelArgs {
   apiKey: string
   config: NotesImportConfig
@@ -23,12 +40,14 @@ export interface RunModelArgs {
   context: NotesImportContext
   refinement?: RefinementInput
   abortSignal?: AbortSignal
+  /** Optional live progress sink. Absent on the legacy synchronous path. */
+  onProgress?: (p: ModelProgress) => void
 }
 
 export interface RunModelOutput {
   result: NotesImportResult
-  usage: Awaited<ReturnType<typeof generateObject>>['usage']
-  /** Which underlying provider the gateway actually used (for ZDR audit logs). */
+  usage: LanguageModelUsage
+  /** Which underlying provider OpenRouter actually used (for ZDR audit logs). */
   resolvedProvider?: string
 }
 
@@ -38,9 +57,9 @@ const buildRefinementPrompt = (
 ): string =>
   `Here are the user's ORIGINAL notes:
 
-"""
+<ORIGINAL NOTES>
 ${notesText}
-"""
+</ORIGINAL NOTES>
 
 You previously produced this structured result:
 
@@ -51,15 +70,35 @@ result for the ORIGINAL notes above — not a diff, the whole object — with th
 correction incorporated. Keep everything else the same unless the correction
 implies otherwise.
 
-User correction: ${refinement.instruction}`
+<USER CORRECTION>
+${refinement.instruction}
+</USER CORRECTION>
+`
+
+/** Emit a `progress` tick at most every N streamed output chars. */
+const PROGRESS_CHAR_STRIDE = 400
 
 /**
- * Runs the notes-import model through the Vercel AI Gateway. Routing is pinned
- * to the configured Western provider allowlist with `zeroDataRetention` and
- * `disallowPromptTraining` set, so the request only reaches a ZDR host (ADR
- * 0008). Output is structurally validated against NOTES_IMPORT_SCHEMA by
- * `generateObject` — a non-conforming response throws rather than returning
- * garbage.
+ * Runs the notes-import model through OpenRouter, streaming. Routing is pinned to
+ * the configured provider allowlist with `zdr: true` and `data_collection:
+ * 'deny'`, so the request only reaches a zero-data-retention host (ADR 0008) —
+ * falling back across the allowlist but never to a non-ZDR provider, and failing
+ * the request rather than leaking to one.
+ *
+ * Uses the AI SDK v6 `streamText` + `Output.object` API (the non-deprecated
+ * successor to `generateObject`): the model is still forced to the
+ * NOTES_IMPORT_SCHEMA shape and `result.output` resolves to the parsed object
+ * (throwing on a non-conforming response). The `fullStream` is drained ONLY to
+ * surface progress via `onProgress`; the structured result is never built from
+ * those deltas.
+ *
+ * Reasoning is ON by default (`config.reasoningEffort`, `xhigh` = the model's
+ * "Think Max"). The model co-emits reasoning and strict JSON, but some ZDR hosts
+ * ship a buggy reasoning parser that misroutes the final JSON into the reasoning
+ * channel and returns a blank completion (cf. the vLLM deepseek reasoning-parser
+ * bug). When that happens `result.output` rejects, so we recover the
+ * schema-shaped object from the buffered reasoning text (`recoverNotesImportJson`)
+ * before giving up — the answer was complete, just on the wrong channel.
  */
 export const runNotesImportModel = async ({
   apiKey,
@@ -68,17 +107,22 @@ export const runNotesImportModel = async ({
   context,
   refinement,
   abortSignal,
+  onProgress,
 }: RunModelArgs): Promise<RunModelOutput> => {
-  const gw = createGateway({ apiKey })
+  const openrouter = createOpenRouter({ apiKey })
 
-  const { object, usage, providerMetadata } = await generateObject({
-    model: gw(config.model),
-    schema: jsonSchema<NotesImportResult>(
-      NOTES_IMPORT_SCHEMA as unknown as JSONSchema7
-    ),
-    schemaName: 'NotesImport',
-    schemaDescription:
-      'Structured WitnessWork records parsed from free-form ministry notes.',
+  onProgress?.({ kind: 'phase', phase: 'starting' })
+
+  const result = streamText({
+    model: openrouter(config.model),
+    output: Output.object({
+      schema: jsonSchema<NotesImportResult>(
+        NOTES_IMPORT_SCHEMA as unknown as JSONSchema7
+      ),
+      name: 'NotesImport',
+      description:
+        'Structured WitnessWork records parsed from free-form ministry notes.',
+    }),
     system: buildNotesImportSystemPrompt(context),
     prompt: refinement
       ? buildRefinementPrompt(notesText, refinement)
@@ -88,21 +132,146 @@ export const runNotesImportModel = async ({
     maxRetries: 2,
     abortSignal,
     providerOptions: {
-      gateway: {
-        zeroDataRetention: true,
-        disallowPromptTraining: true,
-        only: config.providers,
+      openrouter: {
+        // HARD ZDR INVARIANT (ADR 0008): `zdr: true` + `data_collection: 'deny'`
+        // are global filters OpenRouter applies to every candidate (including
+        // fallbacks), so routing can never reach a data-retaining host. `only`
+        // pins to the vetted Western allowlist (jurisdiction bound); `order`
+        // makes the SAME list a priority sequence, so the preferred host
+        // (Fireworks — verified genuine reasoning) is tried first and a 429/error
+        // falls back to the next Western host (DigitalOcean) WITHOUT escaping the
+        // allowlist. If none can serve, the request errors.
+        provider: {
+          only: config.providers,
+          order: config.providers,
+          data_collection: 'deny',
+          zdr: true,
+          allow_fallbacks: true,
+        },
+        // "Thinking" stream — ON by default (config.reasoningEffort, `xhigh` =
+        // the model's max). If a routed ZDR host's reasoning parser misroutes
+        // the JSON into the reasoning channel (blank completion), the recovery
+        // path below salvages it. See the function-level doc.
+        ...(config.reasoningEffort
+          ? { reasoning: { enabled: true, effort: config.reasoningEffort } }
+          : {}),
       },
     },
   })
 
-  const routing = (
-    providerMetadata?.gateway as { routing?: { resolvedProvider?: string } } | undefined
-  )?.routing
-
-  return {
-    result: object,
-    usage,
-    resolvedProvider: routing?.resolvedProvider,
+  // Drain the stream for progress ONLY. Phases fire on first reasoning/text.
+  // `reasoningBuffer` accumulates the raw reasoning text so the recovery path
+  // can salvage the JSON if a buggy provider parser misroutes it there.
+  let chars = 0
+  let lastTickAt = 0
+  let sawText = false
+  let sawReasoning = false
+  let reasoningBuffer = ''
+  for await (const part of result.fullStream) {
+    if (part.type === 'reasoning-start') {
+      if (!sawReasoning) {
+        sawReasoning = true
+        onProgress?.({ kind: 'phase', phase: 'thinking' })
+      }
+    } else if (part.type === 'reasoning-delta') {
+      if (part.text) {
+        reasoningBuffer += part.text
+        onProgress?.({ kind: 'reasoning', text: part.text })
+      }
+    } else if (part.type === 'text-delta') {
+      if (!sawText) {
+        sawText = true
+        onProgress?.({ kind: 'phase', phase: 'structuring' })
+      }
+      chars += part.text.length
+      if (chars - lastTickAt >= PROGRESS_CHAR_STRIDE) {
+        lastTickAt = chars
+        onProgress?.({ kind: 'progress', chars })
+      }
+    }
   }
+
+  // Usage + routing resolve independently of output parsing — read them first so
+  // we can log reasoning-token spend even when the structured parse needs the
+  // recovery fallback below.
+  const usage = await result.usage
+  const providerMetadata = await result.providerMetadata
+  const resolvedProvider = (
+    providerMetadata?.openrouter as { provider?: string } | undefined
+  )?.provider
+
+  // The authoritative, schema-shaped object. `result.output` rejects on a
+  // non-conforming (or blank) completion — which, with reasoning on, usually
+  // means a buggy provider parser dumped the JSON into the reasoning channel.
+  // Recover it from the reasoning buffer before surfacing the failure.
+  let object: NotesImportResult
+  let recovered = false
+  try {
+    object = await result.output
+  } catch (err) {
+    const salvaged = recoverNotesImportJson(reasoningBuffer)
+    if (!salvaged) throw err
+    object = salvaged
+    recovered = true
+  }
+
+  console.log(
+    `notes-import model resolved provider=${resolvedProvider ?? 'unknown'} ` +
+      `reasoningTokens=${usage.reasoningTokens ?? 0} ` +
+      `outputTokens=${usage.outputTokens ?? 0}` +
+      (recovered ? ' recovered=reasoning-channel' : '')
+  )
+
+  return { result: object, usage, resolvedProvider }
+}
+
+/**
+ * Salvage the structured result when a provider's reasoning parser misroutes the
+ * final JSON into the reasoning channel (leaving the completion blank, so
+ * `result.output` rejects). The reasoning buffer in that case holds the
+ * complete, schema-shaped JSON. Strip any `<think>` wrapper, slice to the
+ * outermost object, parse, and structurally sanity-check it. Returns null when
+ * the buffer is not a usable result, so the caller surfaces the real error.
+ */
+const recoverNotesImportJson = (reasoning: string): NotesImportResult | null => {
+  if (!reasoning) return null
+  const unwrapped = reasoning.replace(/<\/?think>/gi, '')
+  const start = unwrapped.indexOf('{')
+  const end = unwrapped.lastIndexOf('}')
+  if (start === -1 || end <= start) return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(unwrapped.slice(start, end + 1))
+  } catch {
+    return null
+  }
+  if (!isNotesImportResultShape(parsed)) return null
+  // `summary` and `assistantMessage` are schema-required, but this salvage path
+  // bypasses `Output.object`'s strict validation; default them so the recovered
+  // object stays type-sound.
+  const str = (v: unknown): string => (typeof v === 'string' ? v : '')
+  return {
+    ...parsed,
+    summary: str((parsed as { summary?: unknown }).summary),
+    assistantMessage: str((parsed as { assistantMessage?: unknown }).assistantMessage),
+  }
+}
+
+/**
+ * Light structural guard for a recovered result. The provider already enforced
+ * the full schema via `response_format` strict mode; this only confirms we
+ * salvaged a plausibly-complete object (all required top-level collections
+ * present) before bypassing `Output.object`'s own validation.
+ */
+const isNotesImportResultShape = (v: unknown): v is NotesImportResult => {
+  if (typeof v !== 'object' || v === null) return false
+  const o = v as Record<string, unknown>
+  return (
+    Array.isArray(o.contacts) &&
+    Array.isArray(o.visits) &&
+    Array.isArray(o.timeEntries) &&
+    Array.isArray(o.categories) &&
+    Array.isArray(o.warnings) &&
+    'publisher' in o
+  )
 }

@@ -1,0 +1,557 @@
+import { DurableObject } from 'cloudflare:workers'
+import type { Environment } from '../types'
+import { getNotesImportConfig } from './config'
+import { runNotesImportModel, type ModelProgress } from './llm'
+import {
+  recordUsage,
+  refinementUsageFor,
+  type CreditDecision,
+} from '../credits'
+import {
+  formatSSE,
+  isTerminalEvent,
+  parseLastEventId,
+  type ImportEvent,
+  type ImportStatus,
+  type NotesImportFailure,
+  type NotesImportSuccess,
+  type UnsequencedEvent,
+} from './events'
+import type { NotesImportContext } from './schema'
+
+/**
+ * Everything the kickoff handler hands the run DO. All fields are
+ * structured-clone-safe (passed over DO RPC). Auth, the ZDR routing decision,
+ * supporter status and the credit `decision` are all resolved on the attested
+ * kickoff request and frozen here — the run never re-derives them.
+ */
+export interface StartImportInput {
+  importId: string
+  uuid: string
+  contentHash: string
+  notesText: string
+  context: NotesImportContext
+  refinement?: { previousResultJSON: string; instruction: string }
+  isSupporter: boolean
+  /** True for either a Supporter or an authenticated dev-bypass request. */
+  unmetered?: boolean
+  decision: CreditDecision
+}
+
+export interface RunResultSnapshot {
+  status: ImportStatus | null
+  payload?: NotesImportSuccess
+  error?: NotesImportFailure
+}
+
+/** Flush a buffered reasoning run once it reaches this many chars. */
+const REASONING_FLUSH_CHARS = 120
+
+/**
+ * A live SSE subscriber. Wraps a ReadableStream controller with a `closed` guard
+ * so a hung-up client (whose stream is already cancelled/closed) can never throw
+ * "the stream is not in a state that permits close/enqueue" from a broadcast.
+ */
+interface Subscriber {
+  send(frame: Uint8Array): void
+  close(): void
+  readonly closed: boolean
+}
+
+/**
+ * `NotesImportRun` — one instance per import (keyed by importId). It owns the
+ * long model run, decoupled from any client connection:
+ *
+ *   kickoff RPC → start() → schedules an immediate alarm → alarm() runs the
+ *   model in the background (survives the kickoff request ending and tolerates
+ *   the client never connecting). Every progress event is appended to an
+ *   append-only SQLite log AND fanned out to any attached SSE subscribers.
+ *
+ * A client subscribes via fetch() (SSE), which REPLAYS the log since the
+ * client's `Last-Event-ID` and then tails live — so a dropped/backgrounded
+ * connection resumes losslessly. The final structured result is held for a
+ * retention window (alarm-based cleanup) so a reconnecting client can fetch it
+ * without re-running. Stores notes text only transiently for the run; the
+ * persisted artifacts are the event log + the final result.
+ */
+export class NotesImportRun extends DurableObject<Environment> {
+  #subscribers = new Set<Subscriber>()
+  #encoder = new TextEncoder()
+  #reasonBuf = ''
+  /**
+   * Aborts the in-flight model call when the client interrupts the import. Held
+   * in memory for the lifetime of one `#run` (a cancel after a DO eviction finds
+   * it null — the model call is already dead — and just records the terminal
+   * state). `signal.aborted` also gates late progress events from overwriting the
+   * `cancelled` status.
+   */
+  #aborter: AbortController | null = null
+
+  constructor(ctx: DurableObjectState, env: Environment) {
+    super(ctx, env)
+    ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)`
+    )
+    ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS events (
+         seq  INTEGER PRIMARY KEY AUTOINCREMENT,
+         type TEXT NOT NULL,
+         data TEXT NOT NULL
+       )`
+    )
+  }
+
+  // --- RPC surface --------------------------------------------------------
+
+  /**
+   * Begin (or restart after a failure) an import. Idempotent: a re-kick while
+   * queued/running is a no-op, and a re-kick of a completed import returns
+   * (leaves) the cached result for reconnect. A re-kick of a previously-failed
+   * import starts fresh.
+   */
+  async start(input: StartImportInput): Promise<void> {
+    const status = this.#status()
+    // Any live (queued/starting/thinking/structuring) or completed ('done')
+    // import is left alone — idempotent re-kick / reconnect. Only a fresh DO
+    // (null) or a prior failure ('error') (re)starts.
+    if (status !== null && status !== 'error') return
+
+    // Fresh, or retrying a prior failure → reset and schedule the run. Awaiting
+    // setAlarm means the kickoff's `await start()` guarantees the run is durably
+    // scheduled before it mints the subscribe token and replies.
+    this.ctx.storage.sql.exec('DELETE FROM events')
+    this.#metaSet('input', JSON.stringify(input))
+    this.#metaDel('result')
+    this.#metaDel('error')
+    this.#setStatus('queued')
+    await this.ctx.storage.setAlarm(Date.now())
+  }
+
+  /** Snapshot for a client that reconnects after the live stream has closed. */
+  getResult(): RunResultSnapshot {
+    const status = this.#status()
+    if (status === 'done') {
+      const raw = this.#metaGet('result')
+      return { status, payload: raw ? (JSON.parse(raw) as NotesImportSuccess) : undefined }
+    }
+    if (status === 'error') {
+      const raw = this.#metaGet('error')
+      return {
+        status,
+        error: raw
+          ? (JSON.parse(raw) as NotesImportFailure)
+          : { code: 'unknown', message: 'Import failed' },
+      }
+    }
+    return { status }
+  }
+
+  /**
+   * Interrupt a still-running import. Aborts the in-flight model call so it stops
+   * spending provider tokens, then records a terminal `cancelled` state. Because
+   * `recordUsage` is only ever reached AFTER the model resolves, a cancel before
+   * completion never charges a credit (mirrors the failure path). Frees the
+   * user's concurrency slot immediately so a resend isn't blocked by the cap, and
+   * emits a terminal `cancelled` event so any attached subscriber closes. No-op
+   * once the run is already terminal. Authorized upstream by the kickoff's
+   * subscribe-token capability (same as the stream/result reads).
+   */
+  async cancel(): Promise<RunResultSnapshot> {
+    const status = this.#status()
+    if (
+      status === null ||
+      status === 'done' ||
+      status === 'error' ||
+      status === 'cancelled'
+    ) {
+      return this.getResult()
+    }
+    // Signal the running model to abort. When still 'queued' there's no controller
+    // yet — flipping the status to terminal makes the not-yet-fired run alarm
+    // short-circuit to cleanup (see `alarm()`) instead of calling the model.
+    this.#aborter?.abort()
+    await this.#markCancelled()
+    return this.getResult()
+  }
+
+  /**
+   * Forget this import entirely, on demand. Aborts any in-flight model call (so
+   * it stops spending tokens and — credit only charged on success — is never
+   * billed), frees the user's concurrency slot if it's still held, closes any
+   * live subscriber, and wipes ALL persisted state NOW instead of waiting for
+   * the retention alarm. Idempotent and safe on an already-evicted DO. Backs the
+   * history view's per-row delete; authorized upstream by the kickoff's
+   * subscribe-token capability (same as the stream/result/cancel reads).
+   */
+  async destroy(): Promise<void> {
+    // Stop any running model call. A still-live run holds its input (with the
+    // uuid) — read it BEFORE deleteAll so the slot can be released; a terminal
+    // run already released on its way out and has dropped the input.
+    this.#aborter?.abort()
+    const raw = this.#metaGet('input')
+    if (raw) {
+      try {
+        const input = JSON.parse(raw) as StartImportInput
+        await this.#releaseSlot(input.uuid, input.importId)
+      } catch {
+        /* malformed input — nothing to release */
+      }
+    }
+    for (const s of this.#subscribers) s.close()
+    this.#subscribers.clear()
+    await this.ctx.storage.deleteAll()
+  }
+
+  // --- Background execution ----------------------------------------------
+
+  async alarm(): Promise<void> {
+    const status = this.#status()
+    if (status === null) return
+    if (status === 'done' || status === 'error' || status === 'cancelled') {
+      // Retention window elapsed → evict all state.
+      await this.ctx.storage.deleteAll()
+      return
+    }
+    if (status !== 'queued') {
+      // A prior attempt started (status is starting/thinking/structuring) but
+      // never finished — i.e. the DO was evicted mid-run and the alarm was
+      // redelivered. Bound re-spend: fail rather than re-running the model call.
+      // This path does NOT go through #run's finally, so schedule the retention
+      // cleanup here — otherwise the interrupted run (still holding notesText)
+      // would linger in storage forever with no alarm to evict it.
+      await this.#fail('interrupted', 'The import was interrupted. Please retry.')
+      await this.#scheduleCleanup()
+      return
+    }
+    await this.#run()
+  }
+
+  async #run(): Promise<void> {
+    const raw = this.#metaGet('input')
+    if (!raw) {
+      await this.#fail('server_error', 'Missing import input')
+      return
+    }
+    const input = JSON.parse(raw) as StartImportInput
+    // Mark as started BEFORE the first await so a redelivered alarm (after an
+    // eviction mid-run) is detected as interrupted rather than re-run. The
+    // model's onProgress emits the client-facing 'starting' event itself.
+    this.#setStatus('starting')
+    const config = getNotesImportConfig(this.env)
+    const startedAt = Date.now()
+    console.log(
+      `notes-import[${input.importId}] run starting (refinement=${!!input.refinement})`
+    )
+
+    // Fresh controller per run so a client `cancel()` can abort the model call.
+    this.#aborter = new AbortController()
+    try {
+      const out = await runNotesImportModel({
+        apiKey: this.env.OPENROUTER_API_KEY,
+        config,
+        notesText: input.notesText,
+        context: input.context,
+        refinement: input.refinement,
+        abortSignal: this.#aborter.signal,
+        onProgress: (p) => this.#onProgress(p),
+      })
+      this.#flushReason()
+
+      // Spend the credit only now that the model succeeded (mirrors the legacy
+      // path: a failure never costs the user a credit).
+      const remaining = await recordUsage({
+        kv: this.env.NOTES_KV,
+        uuid: input.uuid,
+        hash: input.contentHash,
+        isSupporter: input.unmetered ?? input.isSupporter,
+        decision: input.decision,
+        freeCredits: config.freeCredits,
+      })
+      const refinements = await refinementUsageFor(
+        this.env.NOTES_KV,
+        input.uuid,
+        input.contentHash,
+        config.maxRefinements
+      )
+
+      const payload: NotesImportSuccess = {
+        result: out.result,
+        contentHash: input.contentHash,
+        refinement: !!input.refinement,
+        credits: {
+          remaining,
+          limit:
+            (input.unmetered ?? input.isSupporter) ? null : config.freeCredits,
+          isSupporter: input.isSupporter,
+          refinements,
+        },
+      }
+      this.#metaSet('result', JSON.stringify(payload))
+      this.#setStatus('done')
+      // Drop the raw notes the instant the run is terminal: only `result` is
+      // needed for the reconnect window, the client already holds the source
+      // text, and a refinement re-sends it — so notesText is dead weight that
+      // would otherwise rest in storage for the full retention hour.
+      this.#metaDel('input')
+      this.#emit({ type: 'done', payload })
+      console.log(
+        `notes-import[${input.importId}] run done in ${
+          Date.now() - startedAt
+        }ms (provider=${out.resolvedProvider ?? 'unknown'} reasoningTokens=${
+          out.usage.reasoningTokens ?? 0
+        })`
+      )
+    } catch (e) {
+      // A client `cancel()` aborts the model call; that's not a failure and must
+      // never charge a credit or overwrite the 'cancelled' terminal state that
+      // cancel() already wrote. Anything else is a genuine model error.
+      if (this.#aborter?.signal.aborted) {
+        console.log(`notes-import[${input.importId}] run cancelled`)
+      } else {
+        console.error('notes-import run model_error', errorDetail(e))
+        await this.#fail(
+          'model_error',
+          'The import model could not process these notes'
+        )
+      }
+    } finally {
+      this.#aborter = null
+      // Free the user's concurrency slot and schedule result cleanup. (When a
+      // cancel raced in, both are idempotent: release is a DELETE, setAlarm
+      // overwrites.)
+      await this.#releaseSlot(input.uuid, input.importId)
+      await this.#scheduleCleanup()
+    }
+  }
+
+  /** Drop the user's concurrency slot in the index DO. Safe to call twice. */
+  async #releaseSlot(uuid: string, importId: string): Promise<void> {
+    try {
+      const idxId = this.env.NOTES_IMPORT_INDEX.idFromName(uuid)
+      await this.env.NOTES_IMPORT_INDEX.get(idxId).release(importId)
+    } catch (e) {
+      console.error('notes-import index release failed', errorDetail(e))
+    }
+  }
+
+  /**
+   * Record the terminal `cancelled` state: drop raw notes, free the concurrency
+   * slot, emit the terminal event, and schedule eviction. Reads the run input for
+   * the uuid/importId BEFORE deleting it. No credit is charged — `recordUsage` is
+   * never reached on this path.
+   */
+  async #markCancelled(): Promise<void> {
+    const raw = this.#metaGet('input')
+    const input = raw ? (JSON.parse(raw) as StartImportInput) : null
+    this.#flushReason()
+    this.#setStatus('cancelled')
+    // A cancelled run never needs its source notes again — drop them now rather
+    // than holding raw notesText until the retention alarm fires.
+    this.#metaDel('input')
+    this.#emit({ type: 'cancelled' })
+    if (input) await this.#releaseSlot(input.uuid, input.importId)
+    await this.#scheduleCleanup()
+  }
+
+  /**
+   * Schedule alarm-based eviction of all this run's state after the retention
+   * window. The retention alarm's handler (`alarm()`, on a `done`/`error` DO)
+   * calls `deleteAll()`. Every terminal transition must route through here so no
+   * run is left holding state — especially raw notesText — with no pending alarm.
+   */
+  async #scheduleCleanup(): Promise<void> {
+    const config = getNotesImportConfig(this.env)
+    await this.ctx.storage.setAlarm(
+      Date.now() + config.resultRetentionSeconds * 1000
+    )
+  }
+
+  /** Map a model progress signal onto the client event stream. */
+  #onProgress(p: ModelProgress): void {
+    // Once a cancel has aborted the run, ignore any in-flight progress so a late
+    // 'phase' event can't overwrite the terminal 'cancelled' status.
+    if (this.#aborter?.signal.aborted) return
+    if (p.kind === 'phase') {
+      this.#flushReason()
+      this.#setStatus(p.phase)
+      this.#emit({ type: 'status', status: p.phase })
+    } else if (p.kind === 'reasoning') {
+      this.#reasonBuf += p.text
+      if (this.#reasonBuf.length >= REASONING_FLUSH_CHARS) this.#flushReason()
+    } else {
+      this.#stream({ type: 'progress', chars: p.chars })
+    }
+  }
+
+  #flushReason(): void {
+    if (!this.#reasonBuf) return
+    const text = this.#reasonBuf
+    this.#reasonBuf = ''
+    this.#stream({ type: 'reasoning', text })
+  }
+
+  async #fail(code: string, message: string): Promise<void> {
+    this.#flushReason()
+    this.#metaSet('error', JSON.stringify({ code, message } satisfies NotesImportFailure))
+    this.#setStatus('error')
+    // A failed run never needs its source notes again — drop them now rather
+    // than holding raw notesText until the retention alarm fires.
+    this.#metaDel('input')
+    this.#emit({ type: 'error', code, message })
+  }
+
+  // --- SSE subscribe ------------------------------------------------------
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url)
+    const cursor = parseLastEventId(
+      request.headers.get('Last-Event-ID') ?? url.searchParams.get('lastEventId')
+    )
+
+    const encoder = this.#encoder
+    let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null
+    let closed = false
+    const sub: Subscriber = {
+      get closed() {
+        return closed
+      },
+      send(frame) {
+        if (closed || !controllerRef) return
+        try {
+          controllerRef.enqueue(frame)
+        } catch {
+          closed = true // client hung up between checks
+        }
+      },
+      close() {
+        if (closed) return
+        closed = true
+        try {
+          controllerRef?.close()
+        } catch {
+          /* client already hung up */
+        }
+      },
+    }
+
+    const stream = new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        controllerRef = controller
+        // Replay everything since the client's cursor (lossless resume). Guarded
+        // because the client may disconnect mid-replay.
+        try {
+          const rows = this.ctx.storage.sql
+            .exec<{ seq: number; data: string }>(
+              'SELECT seq, data FROM events WHERE seq > ? ORDER BY seq',
+              cursor
+            )
+            .toArray()
+          for (const r of rows) {
+            const ev = { ...JSON.parse(r.data), seq: r.seq } as ImportEvent
+            sub.send(encoder.encode(formatSSE(ev)))
+          }
+        } catch {
+          /* enqueue raced a disconnect */
+        }
+        // Already finished → nothing to tail; close after the replay.
+        const status = this.#status()
+        if (status === 'done' || status === 'error') {
+          sub.close()
+          return
+        }
+        this.#subscribers.add(sub)
+      },
+      cancel: () => {
+        closed = true
+        this.#subscribers.delete(sub)
+      },
+    })
+
+    return new Response(stream, {
+      headers: {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-cache, no-transform',
+        connection: 'keep-alive',
+      },
+    })
+  }
+
+  // --- event log + fan-out -----------------------------------------------
+
+  /** Persist an event to the replay log, then broadcast it with its resume seq. */
+  #emit(ev: UnsequencedEvent): void {
+    const row = this.ctx.storage.sql
+      .exec<{ seq: number }>(
+        'INSERT INTO events (type, data) VALUES (?, ?) RETURNING seq',
+        ev.type,
+        JSON.stringify(ev)
+      )
+      .one()
+    this.#broadcast({ ...ev, seq: row.seq } as ImportEvent)
+  }
+
+  /**
+   * Broadcast a cosmetic event (reasoning/progress) to live subscribers WITHOUT
+   * persisting it. The frame carries no `id:` line, so it never advances a
+   * client's `Last-Event-ID`: a reconnect resumes from the last persisted
+   * status/terminal event and re-tails live reasoning, which is throwaway. These
+   * events are ~90% of the per-import volume, so keeping them out of the SQLite
+   * log cuts row writes (and retained log size, and reconnect replay cost) ~10x.
+   */
+  #stream(ev: UnsequencedEvent): void {
+    this.#broadcast(ev)
+  }
+
+  #broadcast(ev: ImportEvent | UnsequencedEvent): void {
+    const frame = this.#encoder.encode(formatSSE(ev))
+    for (const s of this.#subscribers) {
+      s.send(frame)
+      if (s.closed) this.#subscribers.delete(s)
+    }
+    if (isTerminalEvent(ev)) {
+      for (const s of this.#subscribers) s.close()
+      this.#subscribers.clear()
+    }
+  }
+
+  // --- tiny meta helpers --------------------------------------------------
+
+  #status(): ImportStatus | null {
+    return (this.#metaGet('status') as ImportStatus | null) ?? null
+  }
+
+  #setStatus(status: ImportStatus): void {
+    this.#metaSet('status', status)
+  }
+
+  #metaGet(k: string): string | null {
+    const rows = this.ctx.storage.sql
+      .exec<{ v: string }>('SELECT v FROM meta WHERE k = ?', k)
+      .toArray()
+    return rows.length ? rows[0].v : null
+  }
+
+  #metaSet(k: string, v: string): void {
+    this.ctx.storage.sql.exec(
+      'INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)',
+      k,
+      v
+    )
+  }
+
+  #metaDel(k: string): void {
+    this.ctx.storage.sql.exec('DELETE FROM meta WHERE k = ?', k)
+  }
+}
+
+/** Serialize a caught value to a single useful string for DO logs. */
+const errorDetail = (e: unknown): string => {
+  if (e instanceof Error) {
+    return `${e.name}: ${e.message}${e.stack ? `\n${e.stack}` : ''}`
+  }
+  try {
+    return typeof e === 'string' ? e : JSON.stringify(e)
+  } catch {
+    return String(e)
+  }
+}

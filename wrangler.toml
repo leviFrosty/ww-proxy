@@ -52,6 +52,20 @@ REVENUECAT_ENTITLEMENT_ID = "Supporter"
 binding = "NOTES_KV"
 id = "9a9f6d4e4ce3441fb8322aadf19d4904"
 
+# Notes Import streaming DOs (separate dev namespaces; bindings + migrations are
+# NOT inherited from prod, so they are repeated here — keep in sync).
+[[env.dev.durable_objects.bindings]]
+name = "NOTES_IMPORT_RUN"
+class_name = "NotesImportRun"
+
+[[env.dev.durable_objects.bindings]]
+name = "NOTES_IMPORT_INDEX"
+class_name = "NotesImportIndex"
+
+[[env.dev.migrations]]
+tag = "v1"
+new_sqlite_classes = ["NotesImportRun", "NotesImportIndex"]
+
 [[env.dev.ratelimits]]
 name = "RATE_LIMITER"
 namespace_id = "2001"   # distinct from prod's 1001
@@ -81,7 +95,7 @@ IOS_BUNDLE_ID = "com.leviwilkerson.jwtime"
 REVENUECAT_ENTITLEMENT_ID = "Supporter"
 # Notes Import knobs — all optional; see src/notesImport/config.ts for defaults.
 # NOTES_IMPORT_MODEL = "deepseek/deepseek-v4-flash"
-# NOTES_IMPORT_PROVIDERS = "fireworks,deepinfra,baseten,azure"
+# NOTES_IMPORT_PROVIDERS = "fireworks,digitalocean"   # Western ZDR, priority order (ADR 0008)
 # NOTES_IMPORT_MAX_CHARS = "100000"
 # NOTES_IMPORT_MAX_OUTPUT_TOKENS = "16000"
 # NOTES_IMPORT_FREE_CREDITS = "5"
@@ -91,6 +105,14 @@ REVENUECAT_ENTITLEMENT_ID = "Supporter"
 # NO notes text or model output (ADR 0008). Create with:
 #   wrangler kv namespace create NOTES_KV
 # then paste the printed id below.
+#
+# Manual feature kill-switch (read by GET /notes-import/status). Turn the import
+# entry points OFF in the app with no redeploy, and back ON by deleting the key:
+#   wrangler kv key put --binding NOTES_KV notes-import:enabled false   # off
+#   wrangler kv key delete --binding NOTES_KV notes-import:enabled      # on
+# (add `--env dev` for the dev worker). Absent = enabled. The same endpoint also
+# auto-disables when no allowlisted ZDR provider is healthy (OpenRouter metadata,
+# no inference cost), cached under `notes-import:provider-health`.
 [[kv_namespaces]]
 binding = "NOTES_KV"
 id = "92871586e6dc4558a6ad3552ed7ee28c"
@@ -103,6 +125,21 @@ namespace_id = "1001"
   limit = 60
   period = 60
 
+# Notes Import streaming — per-import run DO + per-user cap/index DO, each
+# SQLite-backed (event log / active-import set). See
+# docs/notes-import-streaming-durable-objects.md. Repeated under [env.dev] above.
+[[durable_objects.bindings]]
+name = "NOTES_IMPORT_RUN"
+class_name = "NotesImportRun"
+
+[[durable_objects.bindings]]
+name = "NOTES_IMPORT_INDEX"
+class_name = "NotesImportIndex"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["NotesImportRun", "NotesImportIndex"]
+
 [observability]
 enabled = true
 head_sampling_rate = 1 # optional. default = 1.
@@ -111,6 +148,6 @@ logs.persist = true
 # Secrets should be set via:
 # wrangler secret put HERE_API_KEY
 # wrangler secret put SENTRY_DSN
-# wrangler secret put AI_GATEWAY_API_KEY        # Vercel AI Gateway key (ZDR host)
+# wrangler secret put OPENROUTER_API_KEY        # OpenRouter key (routed ZDR-only)
 # wrangler secret put REVENUECAT_API_KEY        # RevenueCat REST v1 secret (sk_...)
 # wrangler secret put NOTES_IMPORT_DEV_BYPASS_TOKEN   # DEV/STAGING worker only — never prod

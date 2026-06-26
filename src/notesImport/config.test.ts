@@ -8,7 +8,7 @@ describe('getNotesImportConfig', () => {
   it('falls back to generous defaults', () => {
     const cfg = getNotesImportConfig(baseEnv)
     expect(cfg.model).toBe('deepseek/deepseek-v4-flash')
-    expect(cfg.providers).toEqual(['fireworks', 'deepinfra', 'baseten', 'azure'])
+    expect(cfg.providers).toEqual(['fireworks', 'digitalocean'])
     expect(cfg.maxChars).toBe(100_000)
     expect(cfg.maxOutputTokens).toBe(16_000)
     expect(cfg.freeCredits).toBe(5)
