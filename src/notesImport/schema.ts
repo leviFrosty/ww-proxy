@@ -152,6 +152,15 @@ export interface NotesImportResult {
   categories: NotesImportDtoCategory[]
   publisher: NotesImportDtoPublisher | null
   warnings: NotesImportWarning[]
+  /** A ≤5-word model-generated label for the batch; the import's row title once Ready. */
+  summary: string
+  /**
+   * A single, friendly chat message from "WWork AI" to the user, summarizing the
+   * whole-import assumptions worth verifying and asking any clarifying questions
+   * about what's missing or ambiguous. Empty string when there's nothing to say.
+   * Shown as a chat bubble beneath the import preview — NOT a per-record warning.
+   */
+  assistantMessage: string
 }
 
 /**
@@ -169,6 +178,8 @@ export const NOTES_IMPORT_SCHEMA = {
     'categories',
     'publisher',
     'warnings',
+    'summary',
+    'assistantMessage',
   ],
   properties: {
     contacts: {
@@ -188,7 +199,7 @@ export const NOTES_IMPORT_SCHEMA = {
           name: { type: 'string' },
           phone: { type: 'string' },
           email: { type: 'string' },
-          gender: { type: 'string', enum: ['male', 'female', 'unknown'] },
+          gender: { type: 'string', enum: ['male', 'female', 'unknown'], description: "Unknown is an specific gender type where the user explicitly says they're unsure of the gender. Leave as undefined/unset if not provided by user." },
           address: {
             type: 'object',
             additionalProperties: false,
@@ -204,7 +215,7 @@ export const NOTES_IMPORT_SCHEMA = {
           note: {
             type: 'string',
             description:
-              'Standing info about the PERSON (interests, family, do-not-call). Per-visit remarks belong on the visit, not here.',
+              'Standing info about the PERSON (interests, family, do-not-call). Only notate long-lived data points, such as their age, marriage status, employment, etc. Do not notate per-visit or future conversation remarks here; they belong on the visit object.',
           },
         },
       },
@@ -260,9 +271,9 @@ export const NOTES_IMPORT_SCHEMA = {
             properties: {
               date: {
                 type: 'string',
-                description: 'ISO-8601 date/datetime of the planned return.',
+                description: 'ISO-8601 date/datetime of the planned return. If a time is provided by the user, include it here, e.g. 2026-06-21T23:47:00Z.',
               },
-              topic: { type: 'string' },
+              topic: { type: 'string', description: "Follow up topic or reason for the planned return, what they will discuss next or remember to bring up. Retain the entirety of the users' note as-is. The visit note and follow-up topic as exclusive and shouldn't be reused." },
             },
           },
         },
@@ -294,11 +305,11 @@ export const NOTES_IMPORT_SCHEMA = {
             description:
               'Remainder minutes only (0-59). Convert "1.5h"→hours:1,minutes:30 and "90 min"→hours:1,minutes:30.',
           },
-          note: { type: 'string' },
+          note: { type: 'string', description: "User provided note about what they did on that specific date. (e.g., 'Carts w/ Sam', 'Door-to-door'" },
           categoryId: {
             type: 'string',
             description:
-              'Reuse an EXISTING category id (from existingCategories) when the type matches one.',
+              'Reuse an EXISTING category id (from existingCategories) when the type matches one. Time maps directly to STANDARD category unless explicitly provided by user.',
           },
           categoryName: {
             type: 'string',
@@ -323,7 +334,7 @@ export const NOTES_IMPORT_SCHEMA = {
         required: ['name', 'isCredit'],
         properties: {
           name: { type: 'string' },
-          isCredit: { type: 'boolean' },
+          isCredit: { type: 'boolean', description: "True for credit time (LDC/RBC/construction, theocratic-school assignments). Leave unset for ordinary field service types, or categories of field service (e.g. Carts, Door-to-door, Business Territory). When in doubt, add a WARNING to ask for clarification." },
         },
       },
     },
@@ -354,7 +365,7 @@ export const NOTES_IMPORT_SCHEMA = {
     warnings: {
       type: 'array',
       description:
-        'Structured notes for the user about assumptions, ambiguities, low-confidence guesses, and anything you could NOT confidently place. Empty array when nothing to flag.',
+        'Per-record flags ONLY — each one points (via target) at a specific contact, visit, time entry, category, or the publisher row so the app can highlight it. Whole-import assumptions, unplaceable items, and clarifying questions go in assistantMessage instead, NOT here. Empty array when no specific row needs flagging.',
       items: {
         type: 'object',
         additionalProperties: false,
@@ -380,7 +391,7 @@ export const NOTES_IMPORT_SCHEMA = {
             additionalProperties: false,
             required: ['kind', 'ref'],
             description:
-              'The record this warning is about, so the preview can highlight it. Omit for a general/whole-import warning.',
+              'The record this warning is about, so the preview can highlight it. Must reference a record that exists in this response AND that the warning is literally about. Every warning should have one — a concern with no specific record to point at (a whole-import assumption, an omitted visit, an unidentifiable person, a dropped fragment) belongs in assistantMessage, not here. Never attach a warning to an unrelated contact.',
             properties: {
               kind: {
                 type: 'string',
@@ -395,6 +406,16 @@ export const NOTES_IMPORT_SCHEMA = {
           },
         },
       },
+    },
+    summary: {
+      type: 'string',
+      description:
+        'A concise label of at most 5 words for this batch of notes, used as the import\'s row title (e.g. "Tuesday cart witnessing", "Three return visits"). Describe the content of the notes, not the act of importing them. No trailing punctuation or surrounding quotes.',
+    },
+    assistantMessage: {
+      type: 'string',
+      description:
+        'A single friendly chat message (1-3 sentences) from "WWork AI" addressed to the user, in the notes\' own language. Summarize the whole-import assumptions worth double-checking and ask any clarifying questions about what was missing, ambiguous, or could not be placed (e.g. "I assumed every visit happened this month since no dates were given — can you confirm? I also wasn\'t sure who the Tuesday study was with."). This REPLACES general/whole-import warnings: put such notes here, conversationally, instead of in warnings[]. Empty string when there is genuinely nothing to verify or ask.',
     },
   },
 } as const
