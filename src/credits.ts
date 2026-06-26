@@ -135,6 +135,23 @@ const remainingFor = async (
   freeCredits: number
 ): Promise<number> => Math.max(0, freeCredits - (await readCount(kv, uuid)))
 
+export interface RefinementUsage {
+  remaining: number
+  limit: number
+}
+
+/** Reads the authoritative per-source refinement allowance after a run. */
+export const refinementUsageFor = async (
+  kv: KvLike,
+  uuid: string,
+  hash: string,
+  maxRefinements: number
+): Promise<RefinementUsage> => {
+  const record = await readHash(kv, uuid, hash)
+  const used = Math.min(maxRefinements, record?.refinements ?? 0)
+  return { remaining: maxRefinements - used, limit: maxRefinements }
+}
+
 export interface RecordUsageArgs {
   kv: KvLike
   uuid: string

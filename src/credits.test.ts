@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { checkCredit, recordUsage, type KvLike } from './credits'
+import {
+  checkCredit,
+  recordUsage,
+  refinementUsageFor,
+  type KvLike,
+} from './credits'
 import { makeMemoryKv } from './test/memoryKv'
 
 const FREE = 5
@@ -91,6 +96,22 @@ describe('credit metering — refinements', () => {
       expect((await consume(kv, 'u1', `other-${i}`)).allowed).toBe(true)
     }
     expect((await consume(kv, 'u1', 'one-too-many')).allowed).toBe(false)
+  })
+
+  it('reports the authoritative refinement allowance for a source hash', async () => {
+    const kv = makeMemoryKv() as unknown as KvLike
+    await consume(kv, 'u1', 'hash-x')
+    expect(await refinementUsageFor(kv, 'u1', 'hash-x', MAXREF)).toEqual({
+      remaining: 5,
+      limit: 5,
+    })
+
+    await consume(kv, 'u1', 'hash-x', { isRefinement: true })
+    await consume(kv, 'u1', 'hash-x', { isRefinement: true })
+    expect(await refinementUsageFor(kv, 'u1', 'hash-x', MAXREF)).toEqual({
+      remaining: 3,
+      limit: 5,
+    })
   })
 })
 

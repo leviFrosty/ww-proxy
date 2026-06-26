@@ -1,5 +1,7 @@
 # Agent guide — ww-proxy
 
+This codebase is the backend API that powers the WitnessWork expo (react native) application found at ~/dev/witness-work.
+
 A Cloudflare Workers API/proxy (HERE API, iOS universal links, Notes Import). See
 `README.md` for general setup; this file documents agent-relevant operational
 details, primarily the **environments**.
@@ -35,7 +37,7 @@ them in sync with the top-level prod config when adding new bindings.
 wrangler kv namespace create NOTES_KV --env dev
 
 # 2. Set the dev worker's secrets (the --env dev flag keeps them off prod).
-wrangler secret put AI_GATEWAY_API_KEY --env dev
+wrangler secret put OPENROUTER_API_KEY --env dev
 wrangler secret put REVENUECAT_API_KEY --env dev
 wrangler secret put NOTES_IMPORT_DEV_BYPASS_TOKEN --env dev   # dev only
 # Plus any other secrets prod uses that dev needs (HERE_API_KEY, SENTRY_DSN, ...).
@@ -68,3 +70,22 @@ pnpm exec tsc --noEmit
 wrangler deploy --dry-run            # prod build
 wrangler deploy --env dev --dry-run  # dev build
 ```
+
+## Backlog
+
+- **Notes Import streaming / Durable Objects migration** — DONE (2026-06-23).
+  The model run now streams from two SQLite Durable Objects (`NotesImportRun`
+  per import, `NotesImportIndex` per user for the concurrency cap), via AI SDK
+  v6 `streamText` + `Output.object`. Attested kickoff (`POST
+  /notes-import/kickoff`) → SSE progress stream (`GET /notes-import/:id/events`)
+  → result snapshot (`/result`); the legacy `POST /notes-import` remains as a
+  fallback. First deploy applies the `v1` DO migration automatically (prod +
+  `--env dev`). Reasoning is ON by default at `xhigh`
+  (`NOTES_IMPORT_REASONING_EFFORT`) — on OpenRouter `deepseek-v4-flash` accepts
+  only `high`/`xhigh`, and `xhigh` IS its max ("Think Max"); `max` is invalid
+  there and coerced to `xhigh`. The model co-emits reasoning and strict
+  structured output. A buggy ZDR-host parser can misroute the JSON into the
+  reasoning channel (blank completion); the run DO recovers it, so reasoning
+  stays on. `usage.reasoningTokens` is logged per run. Architecture + resolved
+  decisions:
+  [`docs/notes-import-streaming-durable-objects.md`](docs/notes-import-streaming-durable-objects.md).

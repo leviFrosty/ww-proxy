@@ -14,9 +14,10 @@ APPLE_TEAM_ID=YOUR_TEAM_ID_HERE
 
 # --- Notes Import ---------------------------------------------------------
 
-# Vercel AI Gateway API key (reaches the ZDR inference host). Create at
-# https://vercel.com/dashboard → AI Gateway → API Keys.
-AI_GATEWAY_API_KEY=your_ai_gateway_key_here
+# OpenRouter API key. Requests are routed ZDR-only (zero data retention, no
+# training) to the inference host. Create at https://openrouter.ai/keys and
+# enable Zero Data Retention in https://openrouter.ai/settings/privacy.
+OPENROUTER_API_KEY=your_openrouter_key_here
 
 # RevenueCat REST v1 SECRET key (sk_...) for server-side Supporter checks.
 # Project → API keys → Secret keys. NEVER ship this in the app.
