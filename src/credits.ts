@@ -152,6 +152,59 @@ export const refinementUsageFor = async (
   return { remaining: maxRefinements - used, limit: maxRefinements }
 }
 
+/** The usage snapshot the client renders in its meter (kickoff + `done`). */
+export interface CreditsSnapshot {
+  remaining: number | null
+  limit: number | null
+  isSupporter: boolean
+  refinements: RefinementUsage
+}
+
+export interface KickoffCreditsArgs {
+  kv: KvLike
+  uuid: string
+  hash: string
+  decision: CreditDecision
+  /** The real Supporter entitlement (drives the snapshot's `isSupporter`). */
+  isSupporter: boolean
+  /** Supporter OR dev bypass — both suppress the import limit (`limit: null`). */
+  unmetered: boolean
+  freeCredits: number
+  maxRefinements: number
+}
+
+/**
+ * Builds the usage snapshot to return at KICKOFF — before the model runs — so
+ * the client shows the meter the moment a run starts instead of waiting for the
+ * `done` event. Writes nothing: `decision.remaining` is the read-only
+ * post-settlement credit count the gate already computed, so it equals what
+ * `done` reports. A refinement is charged only on success, so fold this pending
+ * one in here too — otherwise the meter would tick down by one when `done`
+ * lands. (For a new hash or a free replay, `decision.isRefinement` is false and
+ * the refinement count is unchanged.)
+ */
+export const kickoffCredits = async ({
+  kv,
+  uuid,
+  hash,
+  decision,
+  isSupporter,
+  unmetered,
+  freeCredits,
+  maxRefinements,
+}: KickoffCreditsArgs): Promise<CreditsSnapshot> => {
+  const usage = await refinementUsageFor(kv, uuid, hash, maxRefinements)
+  const refinements = decision.isRefinement
+    ? { ...usage, remaining: Math.max(0, usage.remaining - 1) }
+    : usage
+  return {
+    remaining: decision.remaining,
+    limit: unmetered ? null : freeCredits,
+    isSupporter,
+    refinements,
+  }
+}
+
 export interface RecordUsageArgs {
   kv: KvLike
   uuid: string

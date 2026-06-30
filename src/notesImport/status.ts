@@ -10,9 +10,14 @@ export type StatusKv = Pick<KVNamespace, 'get' | 'put'>
  * actually run. Two independent gates, cheapest first:
  *
  *   1. Manual KV kill-switch (`notes-import:enabled`) — flip the feature off (or
- *      back on) instantly with no redeploy:
- *         wrangler kv key put --binding NOTES_KV notes-import:enabled false
- *      Absent or anything other than a falsy string = enabled (default on).
+ *      back on) instantly with no redeploy. The value is a JSON record mirroring
+ *      the status response:
+ *         {"available": false, "reason": "down for maintenance"}   // force OFF
+ *         {"available": true,  "reason": ""}                       // default ON
+ *      Only `available: false` short-circuits (the app shows `reason`, if any).
+ *      `available: true` (or an absent key) falls through to the provider check,
+ *      so the auto-disable below still applies. Bare `false`/`off` strings are
+ *      also honored for back-compat.
  *
  *   2. Provider health — OpenRouter's endpoints metadata API reports a per-host
  *      `status`. We check whether ANY provider on our ZDR allowlist is currently
@@ -25,11 +30,13 @@ export type StatusKv = Pick<KVNamespace, 'get' | 'put'>
  * import path still enforces attestation, credits, and ZDR routing server-side.
  */
 
+/** Machine reasons the worker emits; operators may set free-form text instead. */
 export type NotesImportUnavailableReason = 'disabled' | 'no_provider'
 
 export interface NotesImportStatusResponse {
   available: boolean
-  reason?: NotesImportUnavailableReason
+  /** A known reason, or operator-supplied text from the kill-switch record. */
+  reason?: string
 }
 
 const ENABLED_KEY = 'notes-import:enabled'
@@ -115,6 +122,41 @@ const probeProviderHealth = async (
 
 const KILL_SWITCH_OFF = new Set(['false', 'off', '0', 'no', 'disabled'])
 
+interface EnabledOverride {
+  available: boolean
+  reason?: string
+}
+
+/**
+ * Parses the `notes-import:enabled` record into a manual override, or null when
+ * the value is absent/unrecognized (→ no override, fall through to the probe).
+ * Accepts the canonical JSON `{ available, reason }`, a bare JSON boolean, and
+ * legacy falsy strings (`false`/`off`/...).
+ */
+const parseEnabledOverride = (raw: string | null): EnabledOverride | null => {
+  if (raw == null) return null
+  const trimmed = raw.trim()
+  if (!trimmed) return null
+  if (KILL_SWITCH_OFF.has(trimmed.toLowerCase())) return { available: false }
+
+  try {
+    const parsed: unknown = JSON.parse(trimmed)
+    if (typeof parsed === 'boolean') return { available: parsed }
+    if (parsed && typeof parsed === 'object' && 'available' in parsed) {
+      const obj = parsed as { available?: unknown; reason?: unknown }
+      const reason =
+        typeof obj.reason === 'string' && obj.reason.trim().length > 0
+          ? obj.reason.trim()
+          : undefined
+      // Anything but an explicit `false` means "not manually disabled".
+      return { available: obj.available !== false, reason }
+    }
+  } catch {
+    // Not JSON and not a known string → treat as no override.
+  }
+  return null
+}
+
 export interface NotesImportStatusDeps {
   kv: StatusKv
   apiKey: string
@@ -133,10 +175,11 @@ export const getNotesImportStatus = async ({
   config,
   fetchFn = fetch,
 }: NotesImportStatusDeps): Promise<NotesImportStatusResponse> => {
-  // 1. Manual kill-switch.
-  const flag = (await kv.get(ENABLED_KEY))?.trim().toLowerCase()
-  if (flag != null && KILL_SWITCH_OFF.has(flag)) {
-    return { available: false, reason: 'disabled' }
+  // 1. Manual kill-switch. Only an explicit `available: false` short-circuits;
+  // `available: true` falls through to the provider check below.
+  const override = parseEnabledOverride(await kv.get(ENABLED_KEY))
+  if (override && !override.available) {
+    return { available: false, reason: override.reason ?? 'disabled' }
   }
 
   // 2. Provider health (cached).
