@@ -155,7 +155,7 @@ export interface NotesImportResult {
   /** A ≤5-word model-generated label for the batch; the import's row title once Ready. */
   summary: string
   /**
-   * A single, friendly chat message from "WWork AI" to the user, summarizing the
+   * A single, friendly chat message from "Scribe AI" to the user, summarizing the
    * whole-import assumptions worth verifying and asking any clarifying questions
    * about what's missing or ambiguous. Empty string when there's nothing to say.
    * Shown as a chat bubble beneath the import preview — NOT a per-record warning.
@@ -415,7 +415,7 @@ export const NOTES_IMPORT_SCHEMA = {
     assistantMessage: {
       type: 'string',
       description:
-        'A single friendly chat message (1-3 sentences) from "WWork AI" addressed to the user, in the notes\' own language. Summarize the whole-import assumptions worth double-checking and ask any clarifying questions about what was missing, ambiguous, or could not be placed (e.g. "I assumed every visit happened this month since no dates were given — can you confirm? I also wasn\'t sure who the Tuesday study was with."). This REPLACES general/whole-import warnings: put such notes here, conversationally, instead of in warnings[]. Empty string when there is genuinely nothing to verify or ask.',
+        'A single friendly chat message (1-3 sentences) from "Scribe AI" addressed to the user, in the notes\' own language. Summarize the whole-import assumptions worth double-checking and ask any clarifying questions about what was missing, ambiguous, or could not be placed (e.g. "I assumed every visit happened this month since no dates were given — can you confirm? I also wasn\'t sure who the Tuesday study was with."). This REPLACES general/whole-import warnings: put such notes here, conversationally, instead of in warnings[]. Empty string when there is genuinely nothing to verify or ask.',
     },
   },
 } as const

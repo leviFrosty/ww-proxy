@@ -80,6 +80,44 @@ describe('getNotesImportStatus — kill-switch', () => {
     expect(fetchFn).not.toHaveBeenCalled()
   })
 
+  it('reports disabled with operator reason from a JSON record, without probing', async () => {
+    const kv = makeMemoryKv()
+    await kv.put(
+      'notes-import:enabled',
+      JSON.stringify({ available: false, reason: 'down for maintenance' })
+    )
+    const fetchFn = vi.fn() as unknown as typeof fetch
+
+    const res = await getNotesImportStatus({
+      kv: kv as unknown as StatusKv,
+      apiKey: 'k',
+      config: CONFIG,
+      fetchFn,
+    })
+
+    expect(res).toEqual({ available: false, reason: 'down for maintenance' })
+    expect(fetchFn).not.toHaveBeenCalled()
+  })
+
+  it('falls through to the provider check when the JSON record is available:true', async () => {
+    const kv = makeMemoryKv()
+    await kv.put(
+      'notes-import:enabled',
+      JSON.stringify({ available: true, reason: '' })
+    )
+    const fetchFn = okFetch(
+      endpointsBody([{ provider_name: 'Fireworks', status: 0 }])
+    )
+    const res = await getNotesImportStatus({
+      kv: kv as unknown as StatusKv,
+      apiKey: 'k',
+      config: CONFIG,
+      fetchFn,
+    })
+    expect(res).toEqual({ available: true })
+    expect(fetchFn).toHaveBeenCalledOnce()
+  })
+
   it('treats an absent flag as enabled', async () => {
     const kv = makeMemoryKv()
     const res = await getNotesImportStatus({

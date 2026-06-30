@@ -8,6 +8,7 @@ import {
   checkCredit,
   recordUsage,
   refinementUsageFor,
+  kickoffCredits,
   type CreditDecision,
 } from '../credits'
 import { runNotesImportModel } from './llm'
@@ -163,6 +164,31 @@ async function authenticateAndGate(
   ctx: AppContext,
   config: NotesImportConfig
 ): Promise<GateResult> {
+  // Kill-switch / provider-health enforcement. `GET /notes-import/status`
+  // advertises this so the app can disable its entry points BEFORE attesting,
+  // but that's only advisory: a client already inside the composer, resuming a
+  // run, or calling the API directly never re-checks it. So enforce the same
+  // gate here — the single boundary both import paths pass through — before
+  // spending an attestation round-trip or any inference. Cheap (KV kill-switch
+  // first, then the cached provider probe) and fail-open by design.
+  const status = await getNotesImportStatus({
+    kv: ctx.env.NOTES_KV,
+    apiKey: ctx.env.OPENROUTER_API_KEY,
+    config,
+  })
+  if (!status.available) {
+    return {
+      ok: false,
+      response: err(
+        ctx,
+        HTTP_STATUS.SERVICE_UNAVAILABLE,
+        'Notes Import is temporarily unavailable',
+        'unavailable',
+        status.reason
+      ),
+    }
+  }
+
   let body: NotesImportBody
   try {
     body = (await ctx.req.json()) as NotesImportBody
@@ -416,7 +442,21 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
     expirationTtl: config.subscribeTokenTtlSeconds,
   })
 
-  return ctx.json({ importId, subscribeToken, refinement: isRefinement })
+  // Usage snapshot up front, so the client's meter populates at run start rather
+  // than only when the `done` event lands. Read-only (no charge) and equal to
+  // the eventual `done` snapshot — see kickoffCredits.
+  const credits = await kickoffCredits({
+    kv: ctx.env.NOTES_KV,
+    uuid,
+    hash: contentHash,
+    decision,
+    isSupporter: supporter,
+    unmetered,
+    freeCredits: config.freeCredits,
+    maxRefinements: config.maxRefinements,
+  })
+
+  return ctx.json({ importId, subscribeToken, refinement: isRefinement, credits })
 }
 
 /** Resolve + authorize a stream request to its run DO, or return an error Response. */

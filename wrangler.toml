@@ -106,13 +106,15 @@ REVENUECAT_ENTITLEMENT_ID = "Supporter"
 #   wrangler kv namespace create NOTES_KV
 # then paste the printed id below.
 #
-# Manual feature kill-switch (read by GET /notes-import/status). Turn the import
-# entry points OFF in the app with no redeploy, and back ON by deleting the key:
-#   wrangler kv key put --binding NOTES_KV notes-import:enabled false   # off
-#   wrangler kv key delete --binding NOTES_KV notes-import:enabled      # on
-# (add `--env dev` for the dev worker). Absent = enabled. The same endpoint also
-# auto-disables when no allowlisted ZDR provider is healthy (OpenRouter metadata,
-# no inference cost), cached under `notes-import:provider-health`.
+# Manual feature kill-switch (read by GET /notes-import/status). A JSON record
+# mirroring the status response; flip the app's import entry points with no
+# redeploy. Only `available:false` forces OFF — `available:true` (or an absent
+# key) falls through to the provider check below:
+#   wrangler kv key put --binding NOTES_KV notes-import:enabled '{"available":false,"reason":"down for maintenance"}'  # off
+#   wrangler kv key put --binding NOTES_KV notes-import:enabled '{"available":true,"reason":""}'                       # on
+# (add `--env dev` for the dev worker). The endpoint also auto-disables when no
+# allowlisted ZDR provider is healthy (OpenRouter metadata, no inference cost),
+# cached under `notes-import:provider-health`.
 [[kv_namespaces]]
 binding = "NOTES_KV"
 id = "92871586e6dc4558a6ad3552ed7ee28c"
