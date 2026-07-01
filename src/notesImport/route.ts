@@ -99,6 +99,7 @@ export async function handleAttestRequest(ctx: AppContext) {
     )
   }
 
+  const config = getNotesImportConfig(ctx.env)
   try {
     await verifyAttestation({
       kv: ctx.env.NOTES_KV,
@@ -108,6 +109,9 @@ export async function handleAttestRequest(ctx: AppContext) {
       uuid,
       teamId: ctx.env.APPLE_TEAM_ID,
       bundleId: ctx.env.IOS_BUNDLE_ID,
+      // Reject dev-environment attestations on prod (dev worker still accepts
+      // them for real-device testing). Heuristic: prod has no dev-bypass token.
+      requireProduction: config.requireProduction,
     })
   } catch (e) {
     if (e instanceof AppAttestError) {

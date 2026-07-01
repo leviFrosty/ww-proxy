@@ -15,6 +15,26 @@ describe('getNotesImportConfig', () => {
     expect(cfg.maxRefinements).toBe(5)
     expect(cfg.entitlementId).toBe('Supporter')
     expect(cfg.devBypassToken).toBeNull()
+    // No dev-bypass token ⇒ prod ⇒ require production attestations.
+    expect(cfg.requireProduction).toBe(true)
+  })
+
+  it('accepts development attestations only where the dev-bypass token is set', () => {
+    const prod = getNotesImportConfig(baseEnv)
+    expect(prod.requireProduction).toBe(true)
+
+    const dev = getNotesImportConfig({
+      ...baseEnv,
+      NOTES_IMPORT_DEV_BYPASS_TOKEN: 'tok',
+    } as Environment)
+    expect(dev.requireProduction).toBe(false)
+
+    // Whitespace-only token is treated as unset (still prod).
+    const blank = getNotesImportConfig({
+      ...baseEnv,
+      NOTES_IMPORT_DEV_BYPASS_TOKEN: '   ',
+    } as Environment)
+    expect(blank.requireProduction).toBe(true)
   })
 
   it('honors env overrides and parses the provider list', () => {

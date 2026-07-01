@@ -8,7 +8,12 @@ import { extractAttestationNonce } from './der'
 import { appIdRpHash, bytesEqual } from './appId'
 import { consumeChallenge } from './challenge'
 import { AppAttestError } from './errors'
-import { putKeyRecord, type AppAttestKv } from './keyStore'
+import {
+  getUuidOwner,
+  putKeyRecord,
+  putUuidOwner,
+  type AppAttestKv,
+} from './keyStore'
 
 // @peculiar/x509 needs a WebCrypto implementation; the Workers global works.
 cryptoProvider.set(crypto as Crypto)
@@ -133,6 +138,32 @@ export const verifyAttestation = async ({
   const environment = decodeEnvironment(parsed.aaguid)
   if (requireProduction && environment !== 'production') {
     throw new AppAttestError('development attestation rejected')
+  }
+
+  // First-writer-wins uuid→keyId pinning (ADR 0007). The crypto above only
+  // proves the caller controls THIS Secure-Enclave key; it says nothing about
+  // whether they may claim `uuid`. Without this, an attacker who knows a
+  // Supporter's uuid (the RevenueCat App User ID — an identifier, not a secret)
+  // could attest their own fresh key to it and ride the victim's entitlement,
+  // and anyone could mint unlimited fresh uuids for fresh free-credit buckets.
+  // So bind each identity to the FIRST key that attests it:
+  //   - unclaimed        → claim it, then proceed;
+  //   - owned by keyId    → idempotent re-attest of the same device, allow;
+  //   - owned by another  → reject (the impersonation boundary).
+  // TRADEOFF: strict first-writer-wins means a legitimate rotation to a NEW
+  // keyId under an existing uuid (e.g. the Enclave key was lost but the Keychain
+  // uuid survived a reinstall) is locked out and needs manual unbinding — an
+  // operator deletes `uuidOwner:<uuid>` and `key:<oldKeyId>` from KV. We accept
+  // that: protecting existing Supporters is the priority, and silent rebinding
+  // would defeat the fix. Write the owner pin BEFORE the key record so a partial
+  // failure is retry-safe: if the pin lands but the record write fails, the same
+  // keyId retries down the idempotent branch; the reverse ordering would leave
+  // `uuid` unclaimed while a key record exists, reopening the race.
+  const owner = await getUuidOwner(kv, uuid)
+  if (owner == null) {
+    await putUuidOwner(kv, uuid, keyId)
+  } else if (owner !== keyId) {
+    throw new AppAttestError('identity already bound to another device')
   }
 
   await putKeyRecord(kv, keyId, {
