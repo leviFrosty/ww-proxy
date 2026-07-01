@@ -4,13 +4,7 @@ import { Sentry } from '../sentry'
 import { sha256Hex, timingSafeEqual, randomToken } from '../crypto'
 import { getNotesImportConfig, type NotesImportConfig } from './config'
 import { isSupporter, RevenueCatError } from '../revenuecat'
-import {
-  checkCredit,
-  recordUsage,
-  refinementUsageFor,
-  kickoffCredits,
-  type CreditDecision,
-} from '../credits'
+import type { CreditDecision } from '../credits'
 import { runNotesImportModel } from './llm'
 import { getNotesImportStatus } from './status'
 import {
@@ -312,9 +306,11 @@ async function authenticateAndGate(
   const unmetered = supporter || devBypass
 
   const isRefinement = !!body.refinement
-  const decision = await checkCredit({
-    kv: ctx.env.NOTES_KV,
-    uuid,
+  // Pre-flight the credit gate in the per-user index DO (single-threaded →
+  // strongly consistent, unlike the old KV read). The commit after a successful
+  // run goes through the same DO, so check and charge can't race.
+  const idxId = ctx.env.NOTES_IMPORT_INDEX.idFromName(uuid)
+  const decision = await ctx.env.NOTES_IMPORT_INDEX.get(idxId).checkCredit({
     hash: contentHash,
     isSupporter: unmetered,
     isRefinement,
@@ -461,9 +457,7 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
   // Usage snapshot up front, so the client's meter populates at run start rather
   // than only when the `done` event lands. Read-only (no charge) and equal to
   // the eventual `done` snapshot — see kickoffCredits.
-  const credits = await kickoffCredits({
-    kv: ctx.env.NOTES_KV,
-    uuid,
+  const credits = await ctx.env.NOTES_IMPORT_INDEX.get(idxId).kickoffCredits({
     hash: contentHash,
     decision,
     isSupporter: supporter,
@@ -592,51 +586,73 @@ export async function handleNotesImportRequest(ctx: AppContext) {
     isRefinement,
   } = gate
 
-  let output
-  try {
-    output = await runNotesImportModel({
-      apiKey: ctx.env.OPENROUTER_API_KEY,
-      config,
-      notesText,
-      context: body.context,
-      refinement: body.refinement,
-    })
-  } catch (e) {
-    Sentry.captureException(e)
-    console.error('notes-import model_error', errorDetail(e))
+  // The legacy path has no run DO, so it must enforce the same per-user
+  // concurrency cap itself — without it a single-second burst of DISTINCT-hash
+  // requests races the meter (the very bypass this fix closes). Namespace the
+  // slot key ('legacy:') so it can NEVER collide with a streaming run's
+  // importId: a run DO releases by the bare importId, so a shared key would let
+  // this path's finally-release drop a live streaming run's slot. Distinct keys
+  // keep the two paths independent; a duplicate-content legacy burst still
+  // collapses to one slot (acquire is idempotent for a held id), while the
+  // distinct-hash attack takes one slot each and is capped. Synchronous path →
+  // a plain try/finally release (no run DO to hand the slot off to).
+  const cap = unmetered ? config.activeImportCapSupporter : config.activeImportCap
+  const idxId = ctx.env.NOTES_IMPORT_INDEX.idFromName(uuid)
+  const idx = ctx.env.NOTES_IMPORT_INDEX.get(idxId)
+  const slotKey = `legacy:${await deriveImportId(uuid, contentHash, body.refinement)}`
+  const acquired = await idx.acquire(slotKey, cap)
+  if (!acquired.ok) {
     return err(
       ctx,
-      HTTP_STATUS.BAD_GATEWAY,
-      'The import model could not process these notes',
-      'model_error',
-      gate.devBypass ? errorDetail(e) : undefined
+      HTTP_STATUS.TOO_MANY_REQUESTS,
+      `You already have ${acquired.active} imports running (max ${cap}).`,
+      'active_cap'
     )
   }
 
-  const remaining = await recordUsage({
-    kv: ctx.env.NOTES_KV,
-    uuid,
-    hash: contentHash,
-    isSupporter: unmetered,
-    decision,
-    freeCredits: config.freeCredits,
-  })
-  const refinements = await refinementUsageFor(
-    ctx.env.NOTES_KV,
-    uuid,
-    contentHash,
-    config.maxRefinements
-  )
+  try {
+    let output
+    try {
+      output = await runNotesImportModel({
+        apiKey: ctx.env.OPENROUTER_API_KEY,
+        config,
+        notesText,
+        context: body.context,
+        refinement: body.refinement,
+      })
+    } catch (e) {
+      Sentry.captureException(e)
+      console.error('notes-import model_error', errorDetail(e))
+      return err(
+        ctx,
+        HTTP_STATUS.BAD_GATEWAY,
+        'The import model could not process these notes',
+        'model_error',
+        gate.devBypass ? errorDetail(e) : undefined
+      )
+    }
 
-  return ctx.json({
-    result: output.result,
-    contentHash,
-    refinement: isRefinement,
-    credits: {
-      remaining,
-      limit: unmetered ? null : config.freeCredits,
-      isSupporter: supporter,
-      refinements,
-    },
-  })
+    // Charge only now that the model succeeded — atomic in the index DO.
+    const { remaining, refinements } = await idx.recordUsage({
+      hash: contentHash,
+      isSupporter: unmetered,
+      decision,
+      freeCredits: config.freeCredits,
+      maxRefinements: config.maxRefinements,
+    })
+
+    return ctx.json({
+      result: output.result,
+      contentHash,
+      refinement: isRefinement,
+      credits: {
+        remaining,
+        limit: unmetered ? null : config.freeCredits,
+        isSupporter: supporter,
+        refinements,
+      },
+    })
+  } finally {
+    await idx.release(slotKey)
+  }
 }

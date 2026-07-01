@@ -1,22 +1,36 @@
 /**
- * Import-credit metering, backed by Cloudflare KV. Stores ONLY counters — never
- * notes text or model output (ADR 0008, decision 7):
- *
- *   credits:<uuid>        → string integer: charged distinct-content imports
- *   hash:<uuid>:<hash>    → JSON { charged, refinements }
+ * Import-credit metering — PURE decision + arithmetic, no storage. The
+ * authoritative counters live in the per-user `NotesImportIndex` Durable Object
+ * (see `notesImport/indexDO.ts`), which is ONE single-threaded instance per
+ * install uuid: its SQLite storage is strongly consistent and its RPC calls are
+ * serialized, so the check-and-commit that used to race over eventually-
+ * consistent KV is now atomic. This module holds only the pure math the DO wraps
+ * (mirrors how `cap.ts` extracts `decideAcquire` out of the index DO), so it
+ * unit-tests without importing the `cloudflare:workers` runtime.
  *
  * Metering unit is 1 credit per distinct content hash. Replays of a known hash
  * and stateless follow-up refinements are free (the latter capped). Supporters
  * are unlimited but their hashes are still recorded so the refinement cap and
- * replay-recognition work uniformly.
+ * replay-recognition work uniformly. Credit is charged AFTER a successful model
+ * run (a failure/cancel must never cost a credit); the residual overage from a
+ * concurrent burst is bounded by the per-user concurrency cap — see
+ * {@link computeCommit}.
+ *
+ * The old KV keys `credits:<uuid>` and `hash:<uuid>:<hash>` are ABANDONED; the
+ * counters moved into the index DO (ADR 0008, decision 7 — the "counters" the
+ * KV note refers to now live in the DO).
  */
 
-/** The subset of KV we use — keeps the module trivially mockable in tests. */
-export type KvLike = Pick<KVNamespace, 'get' | 'put'>
-
-interface HashRecord {
+/** A per-content-hash usage record. */
+export interface HashRecord {
   charged: boolean
   refinements: number
+}
+
+/** The per-user credit state a decision/commit reads. `record` null = new hash. */
+export interface CreditState {
+  count: number
+  record: HashRecord | null
 }
 
 export type CreditDenyReason = 'limit_reached' | 'refinement_limit'
@@ -31,41 +45,24 @@ export interface CreditDecision {
   remaining: number | null
 }
 
-const creditsKey = (uuid: string) => `credits:${uuid}`
-const hashKey = (uuid: string, hash: string) => `hash:${uuid}:${hash}`
-
-const readCount = async (kv: KvLike, uuid: string): Promise<number> => {
-  const raw = await kv.get(creditsKey(uuid))
-  if (!raw) return 0
-  const n = Number.parseInt(raw, 10)
-  return Number.isFinite(n) && n >= 0 ? n : 0
+export interface RefinementUsage {
+  remaining: number
+  limit: number
 }
 
-const readHash = async (
-  kv: KvLike,
-  uuid: string,
-  hash: string
-): Promise<HashRecord | null> => {
-  const raw = await kv.get(hashKey(uuid, hash))
-  if (!raw) return null
-  try {
-    const parsed = JSON.parse(raw) as Partial<HashRecord>
-    return {
-      charged: parsed.charged === true,
-      refinements:
-        typeof parsed.refinements === 'number' && parsed.refinements >= 0
-          ? parsed.refinements
-          : 0,
-    }
-  } catch {
-    return null
-  }
+/** The usage snapshot the client renders in its meter (kickoff + `done`). */
+export interface CreditsSnapshot {
+  remaining: number | null
+  limit: number | null
+  isSupporter: boolean
+  refinements: RefinementUsage
 }
 
-export interface CheckCreditArgs {
-  kv: KvLike
-  uuid: string
-  hash: string
+const clampRemaining = (count: number, freeCredits: number): number =>
+  Math.max(0, freeCredits - count)
+
+export interface DecideCreditArgs {
+  state: CreditState
   isSupporter: boolean
   isRefinement: boolean
   freeCredits: number
@@ -74,19 +71,17 @@ export interface CheckCreditArgs {
 
 /**
  * Pre-flight gate (no writes). Decides whether this import may call the model.
- * Persist the outcome with {@link recordUsage} only after a successful call so a
- * model failure never costs the user a credit.
+ * Persist the outcome with {@link computeCommit} only after a successful call so
+ * a model failure never costs the user a credit.
  */
-export const checkCredit = async ({
-  kv,
-  uuid,
-  hash,
+export const decideCredit = ({
+  state,
   isSupporter,
   isRefinement,
   freeCredits,
   maxRefinements,
-}: CheckCreditArgs): Promise<CreditDecision> => {
-  const record = await readHash(kv, uuid, hash)
+}: DecideCreditArgs): CreditDecision => {
+  const { count, record } = state
 
   if (record) {
     // Known hash → replay or refinement, always free of a new credit.
@@ -96,14 +91,14 @@ export const checkCredit = async ({
         reason: 'refinement_limit',
         isNewHash: false,
         isRefinement: true,
-        remaining: isSupporter ? null : await remainingFor(kv, uuid, freeCredits),
+        remaining: isSupporter ? null : clampRemaining(count, freeCredits),
       }
     }
     return {
       allowed: true,
       isNewHash: false,
       isRefinement,
-      remaining: isSupporter ? null : await remainingFor(kv, uuid, freeCredits),
+      remaining: isSupporter ? null : clampRemaining(count, freeCredits),
     }
   }
 
@@ -111,7 +106,6 @@ export const checkCredit = async ({
   if (isSupporter) {
     return { allowed: true, isNewHash: true, isRefinement: false, remaining: null }
   }
-  const count = await readCount(kv, uuid)
   if (count >= freeCredits) {
     return {
       allowed: false,
@@ -129,42 +123,19 @@ export const checkCredit = async ({
   }
 }
 
-const remainingFor = async (
-  kv: KvLike,
-  uuid: string,
-  freeCredits: number
-): Promise<number> => Math.max(0, freeCredits - (await readCount(kv, uuid)))
-
-export interface RefinementUsage {
-  remaining: number
-  limit: number
-}
-
-/** Reads the authoritative per-source refinement allowance after a run. */
-export const refinementUsageFor = async (
-  kv: KvLike,
-  uuid: string,
-  hash: string,
+/** Reads the authoritative per-source refinement allowance from a record. */
+export const refinementUsage = (
+  record: HashRecord | null,
   maxRefinements: number
-): Promise<RefinementUsage> => {
-  const record = await readHash(kv, uuid, hash)
+): RefinementUsage => {
   const used = Math.min(maxRefinements, record?.refinements ?? 0)
   return { remaining: maxRefinements - used, limit: maxRefinements }
 }
 
-/** The usage snapshot the client renders in its meter (kickoff + `done`). */
-export interface CreditsSnapshot {
-  remaining: number | null
-  limit: number | null
-  isSupporter: boolean
-  refinements: RefinementUsage
-}
-
 export interface KickoffCreditsArgs {
-  kv: KvLike
-  uuid: string
-  hash: string
   decision: CreditDecision
+  /** Current record for the hash (pre-commit); drives the refinement allowance. */
+  record: HashRecord | null
   /** The real Supporter entitlement (drives the snapshot's `isSupporter`). */
   isSupporter: boolean
   /** Supporter OR dev bypass — both suppress the import limit (`limit: null`). */
@@ -183,17 +154,15 @@ export interface KickoffCreditsArgs {
  * lands. (For a new hash or a free replay, `decision.isRefinement` is false and
  * the refinement count is unchanged.)
  */
-export const kickoffCredits = async ({
-  kv,
-  uuid,
-  hash,
+export const computeKickoffCredits = ({
   decision,
+  record,
   isSupporter,
   unmetered,
   freeCredits,
   maxRefinements,
-}: KickoffCreditsArgs): Promise<CreditsSnapshot> => {
-  const usage = await refinementUsageFor(kv, uuid, hash, maxRefinements)
+}: KickoffCreditsArgs): CreditsSnapshot => {
+  const usage = refinementUsage(record, maxRefinements)
   const refinements = decision.isRefinement
     ? { ...usage, remaining: Math.max(0, usage.remaining - 1) }
     : usage
@@ -205,52 +174,80 @@ export const kickoffCredits = async ({
   }
 }
 
-export interface RecordUsageArgs {
-  kv: KvLike
-  uuid: string
-  hash: string
-  isSupporter: boolean
+export interface CommitCreditArgs {
   decision: CreditDecision
+  state: CreditState
+  isSupporter: boolean
   freeCredits: number
 }
 
+export interface CommitCreditResult {
+  /** The next state to persist. */
+  state: CreditState
+  /** Credits remaining after the commit (`null` for Supporters). */
+  remaining: number | null
+}
+
 /**
- * Commits the usage after a successful model call. Returns credits remaining
- * (`null` for Supporters) for the response body.
+ * Computes the post-success commit from the CURRENT state (read atomically by
+ * the index DO immediately before this call). Charge-after-success is race-free
+ * because both the read and the write happen inside the single-threaded DO, so
+ * concurrent commits are serialized — no lost increment (the old KV read-modify-
+ * write dropped writes; this cannot). The one residual is bounded overage: up to
+ * `cap` new-hash imports can pass the pre-flight gate while `count` sits just
+ * under `freeCredits`, then each commit atomically increments, so a user may end
+ * up at most `cap - 1` over the free limit. That's intentional — reserve-then-
+ * refund's failure mode (silently losing a user's credits on a missed refund) is
+ * worse than a tiny bounded overage — and the concurrency cap on BOTH import
+ * paths keeps it small.
+ *
+ * Idempotent per hash: a new-hash charge only increments when the hash isn't
+ * already `charged`, so a re-kick/replay of an already-charged hash never
+ * double-charges (the `charged` flag is the idempotency key).
  */
-export const recordUsage = async ({
-  kv,
-  uuid,
-  hash,
-  isSupporter,
+export const computeCommit = ({
   decision,
+  state,
+  isSupporter,
   freeCredits,
-}: RecordUsageArgs): Promise<number | null> => {
+}: CommitCreditArgs): CommitCreditResult => {
+  const { count, record } = state
+
   if (decision.isNewHash) {
-    await kv.put(
-      hashKey(uuid, hash),
-      JSON.stringify({ charged: !isSupporter, refinements: 0 } satisfies HashRecord)
-    )
-    if (isSupporter) return null
-    const count = await readCount(kv, uuid)
-    const next = count + 1
-    await kv.put(creditsKey(uuid), String(next))
-    return Math.max(0, freeCredits - next)
+    if (isSupporter) {
+      // Record the hash (for the refinement cap + replay recognition) but never
+      // charge. Keep any existing record so this is idempotent.
+      return {
+        state: { count, record: record ?? { charged: false, refinements: 0 } },
+        remaining: null,
+      }
+    }
+    // Idempotency guard: charge a given hash at most once. If it's already
+    // charged (a re-commit / replay), leave the count untouched.
+    if (record?.charged) {
+      return { state, remaining: clampRemaining(count, freeCredits) }
+    }
+    const nextCount = count + 1
+    return {
+      state: {
+        count: nextCount,
+        record: { charged: true, refinements: record?.refinements ?? 0 },
+      },
+      remaining: clampRemaining(nextCount, freeCredits),
+    }
   }
 
   if (decision.isRefinement) {
-    const record = (await readHash(kv, uuid, hash)) ?? {
-      charged: !isSupporter,
-      refinements: 0,
+    const base = record ?? { charged: !isSupporter, refinements: 0 }
+    return {
+      state: {
+        count,
+        record: { charged: base.charged, refinements: base.refinements + 1 },
+      },
+      remaining: isSupporter ? null : clampRemaining(count, freeCredits),
     }
-    await kv.put(
-      hashKey(uuid, hash),
-      JSON.stringify({
-        charged: record.charged,
-        refinements: record.refinements + 1,
-      } satisfies HashRecord)
-    )
   }
 
-  return isSupporter ? null : remainingFor(kv, uuid, freeCredits)
+  // Free replay of a known hash — no state change.
+  return { state, remaining: isSupporter ? null : clampRemaining(count, freeCredits) }
 }
