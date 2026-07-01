@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { decideAcquire } from './cap'
+import { decideAcquire, decideStartOutcome } from './cap'
+import type { ImportStatus } from './events'
 
 describe('decideAcquire', () => {
   it('grants a new import while under the cap', () => {
@@ -15,5 +16,54 @@ describe('decideAcquire', () => {
   it('is idempotent: an already-held id is always granted, even at cap', () => {
     expect(decideAcquire(2, true, 2)).toBe(true)
     expect(decideAcquire(5, true, 2)).toBe(true)
+  })
+})
+
+describe('decideStartOutcome', () => {
+  it("'started' for a fresh run (no prior status) — slot legitimately consumed", () => {
+    expect(decideStartOutcome(null)).toBe('started')
+  })
+
+  it("'started' for a restart after a failure ('error') — slot re-used, not leaked", () => {
+    // 'error' re-kicks actually reschedule the model, so the re-acquired slot is
+    // used, not orphaned. Must NOT be released.
+    expect(decideStartOutcome('error')).toBe('started')
+  })
+
+  it("'running' for every live re-kick — index row still held, acquire was a no-op", () => {
+    const live: ImportStatus[] = [
+      'queued',
+      'starting',
+      'thinking',
+      'structuring',
+    ]
+    for (const status of live) {
+      expect(decideStartOutcome(status)).toBe('running')
+    }
+  })
+
+  it("'terminal' for a settled re-kick ('done'/'cancelled') — acquire re-inserted an ORPHAN row to release", () => {
+    // These are the leak path: start() no-ops (reconnect to the cached result),
+    // but the slot was already released when the run first settled, so the
+    // kickoff's acquire re-inserted an orphan row that must be released.
+    expect(decideStartOutcome('done')).toBe('terminal')
+    expect(decideStartOutcome('cancelled')).toBe('terminal')
+  })
+
+  it('only the terminal outcome demands a release (the leak-fix invariant)', () => {
+    const all: (ImportStatus | null)[] = [
+      null,
+      'queued',
+      'starting',
+      'thinking',
+      'structuring',
+      'done',
+      'error',
+      'cancelled',
+    ]
+    const releasable = all.filter(
+      (s) => decideStartOutcome(s) === 'terminal'
+    )
+    expect(releasable).toEqual(['done', 'cancelled'])
   })
 })

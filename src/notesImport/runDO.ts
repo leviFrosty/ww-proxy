@@ -1,6 +1,7 @@
 import { DurableObject } from 'cloudflare:workers'
 import type { Environment } from '../types'
 import { getNotesImportConfig } from './config'
+import { decideStartOutcome, type StartOutcome } from './cap'
 import { runNotesImportModel, type ModelProgress } from './llm'
 import {
   recordUsage,
@@ -105,16 +106,21 @@ export class NotesImportRun extends DurableObject<Environment> {
 
   /**
    * Begin (or restart after a failure) an import. Idempotent: a re-kick while
-   * queued/running is a no-op, and a re-kick of a completed import returns
+   * queued/running is a no-op, and a re-kick of a settled import returns
    * (leaves) the cached result for reconnect. A re-kick of a previously-failed
    * import starts fresh.
+   *
+   * Returns a {@link StartOutcome} so the kickoff handler can tell whether the
+   * concurrency slot it just acquired was legitimately consumed (`started`),
+   * already held by the live run (`running`), or re-inserted as an ORPHAN row
+   * against an already-settled run (`terminal`) that must be released — the
+   * index DO has no TTL, so a leaked slot locks the user out forever.
    */
-  async start(input: StartImportInput): Promise<void> {
-    const status = this.#status()
-    // Any live (queued/starting/thinking/structuring) or completed ('done')
-    // import is left alone — idempotent re-kick / reconnect. Only a fresh DO
-    // (null) or a prior failure ('error') (re)starts.
-    if (status !== null && status !== 'error') return
+  async start(input: StartImportInput): Promise<StartOutcome> {
+    const outcome = decideStartOutcome(this.#status())
+    // Live or settled import → left alone (idempotent re-kick / reconnect). Only
+    // a fresh DO (null) or a prior failure ('error') → 'started' (re)starts.
+    if (outcome !== 'started') return outcome
 
     // Fresh, or retrying a prior failure → reset and schedule the run. Awaiting
     // setAlarm means the kickoff's `await start()` guarantees the run is durably
@@ -125,6 +131,7 @@ export class NotesImportRun extends DurableObject<Environment> {
     this.#metaDel('error')
     this.#setStatus('queued')
     await this.ctx.storage.setAlarm(Date.now())
+    return 'started'
   }
 
   /** Snapshot for a client that reconnects after the live stream has closed. */
@@ -216,9 +223,21 @@ export class NotesImportRun extends DurableObject<Environment> {
       // A prior attempt started (status is starting/thinking/structuring) but
       // never finished — i.e. the DO was evicted mid-run and the alarm was
       // redelivered. Bound re-spend: fail rather than re-running the model call.
-      // This path does NOT go through #run's finally, so schedule the retention
-      // cleanup here — otherwise the interrupted run (still holding notesText)
-      // would linger in storage forever with no alarm to evict it.
+      // This path does NOT go through #run's finally, so it must do the two
+      // things that finally normally does: free the user's concurrency slot and
+      // schedule retention cleanup. Release BEFORE #fail, which deletes the
+      // `input` meta that holds the uuid/importId. Without the release the slot
+      // leaks forever (the index DO has no TTL); without the cleanup alarm the
+      // interrupted run (still holding notesText) lingers in storage forever.
+      const raw = this.#metaGet('input')
+      if (raw) {
+        try {
+          const input = JSON.parse(raw) as StartImportInput
+          await this.#releaseSlot(input.uuid, input.importId)
+        } catch {
+          /* malformed input — nothing to release */
+        }
+      }
       await this.#fail('interrupted', 'The import was interrupted. Please retry.')
       await this.#scheduleCleanup()
       return
