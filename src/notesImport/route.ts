@@ -408,8 +408,9 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
   }
 
   const runId = ctx.env.NOTES_IMPORT_RUN.idFromName(importId)
+  let outcome
   try {
-    await ctx.env.NOTES_IMPORT_RUN.get(runId).start({
+    outcome = await ctx.env.NOTES_IMPORT_RUN.get(runId).start({
       importId,
       uuid,
       contentHash,
@@ -432,6 +433,17 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
       'server_error',
       gate.devBypass ? errorDetail(e) : undefined
     )
+  }
+
+  // A re-kick of an already-settled run (done/cancelled) does NOT consume the
+  // slot we just acquired: start() no-ops for reconnect, but that run had
+  // already released its slot when it first settled, so acquire() re-inserted an
+  // ORPHAN row. Release it — the index DO has no TTL, so a leaked slot locks the
+  // user out permanently once `cap` of them accumulate. A live/queued re-kick
+  // ('running', slot still in use) and a fresh/error (re)start ('started', slot
+  // legitimately consumed) both keep it. release() is idempotent (a DELETE).
+  if (outcome === 'terminal') {
+    await ctx.env.NOTES_IMPORT_INDEX.get(idxId).release(importId)
   }
 
   // Short-lived capability for the stream. App Attest can't sign a long-lived
