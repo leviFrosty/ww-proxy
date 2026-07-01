@@ -1,118 +1,227 @@
 import { describe, expect, it } from 'vitest'
 import {
-  checkCredit,
-  recordUsage,
-  refinementUsageFor,
-  kickoffCredits,
-  type KvLike,
+  decideCredit,
+  computeCommit,
+  computeKickoffCredits,
+  refinementUsage,
+  type CreditDecision,
+  type CreditState,
+  type HashRecord,
 } from './credits'
-import { makeMemoryKv } from './test/memoryKv'
 
 const FREE = 5
 const MAXREF = 5
 
-/** Gate + (on success) record, mirroring the route's order. */
-const consume = async (
-  kv: KvLike,
-  uuid: string,
+/**
+ * A tiny in-memory stand-in for the index DO's per-user credit storage, so the
+ * pure functions can be exercised through the same read → decide → commit → write
+ * sequence the DO performs. The DO is single-threaded, so applying commits
+ * serially (each reading fresh state) is exactly what production does.
+ */
+class MeterStore {
+  count = 0
+  records = new Map<string, HashRecord>()
+  state(hash: string): CreditState {
+    return { count: this.count, record: this.records.get(hash) ?? null }
+  }
+  apply(hash: string, next: CreditState): void {
+    this.count = next.count
+    if (next.record) this.records.set(hash, next.record)
+  }
+}
+
+/** Gate + (on success) commit, mirroring the route/run-DO order. */
+const consume = (
+  store: MeterStore,
   hash: string,
   opts: { isSupporter?: boolean; isRefinement?: boolean } = {}
-) => {
+): CreditDecision => {
   const isSupporter = opts.isSupporter ?? false
   const isRefinement = opts.isRefinement ?? false
-  const decision = await checkCredit({
-    kv,
-    uuid,
-    hash,
+  const decision = decideCredit({
+    state: store.state(hash),
     isSupporter,
     isRefinement,
     freeCredits: FREE,
     maxRefinements: MAXREF,
   })
   if (!decision.allowed) return decision
-  const remaining = await recordUsage({
-    kv,
-    uuid,
-    hash,
-    isSupporter,
+  const { state: next, remaining } = computeCommit({
     decision,
+    state: store.state(hash),
+    isSupporter,
     freeCredits: FREE,
   })
+  store.apply(hash, next)
   return { ...decision, remaining }
 }
 
 describe('credit metering — non-supporter', () => {
-  it('allows exactly 5 distinct imports then blocks the 6th', async () => {
-    const kv = makeMemoryKv() as unknown as KvLike
+  it('allows exactly 5 distinct imports then blocks the 6th', () => {
+    const store = new MeterStore()
     const remainings: (number | null)[] = []
     for (let i = 0; i < 5; i++) {
-      const r = await consume(kv, 'u1', `hash-${i}`)
+      const r = consume(store, `hash-${i}`)
       expect(r.allowed).toBe(true)
       remainings.push(r.remaining ?? null)
     }
     expect(remainings).toEqual([4, 3, 2, 1, 0])
 
-    const sixth = await consume(kv, 'u1', 'hash-5')
+    const sixth = consume(store, 'hash-5')
     expect(sixth.allowed).toBe(false)
     expect(sixth.reason).toBe('limit_reached')
   })
 
-  it('replays a charged hash for free even after the limit is hit', async () => {
-    const kv = makeMemoryKv() as unknown as KvLike
-    for (let i = 0; i < 5; i++) await consume(kv, 'u1', `hash-${i}`)
+  it('replays a charged hash for free even after the limit is hit', () => {
+    const store = new MeterStore()
+    for (let i = 0; i < 5; i++) consume(store, `hash-${i}`)
     // Already at the cap; replaying an existing hash is still allowed + free.
-    const replay = await consume(kv, 'u1', 'hash-0')
+    const replay = consume(store, 'hash-0')
     expect(replay.allowed).toBe(true)
     expect(replay.isNewHash).toBe(false)
+    expect(store.count).toBe(5) // no extra charge
   })
 
-  it('isolates counts per identity', async () => {
-    const kv = makeMemoryKv() as unknown as KvLike
-    for (let i = 0; i < 5; i++) await consume(kv, 'u1', `h-${i}`)
-    const other = await consume(kv, 'u2', 'h-0')
-    expect(other.allowed).toBe(true)
+  it('isolates counts per identity', () => {
+    // Distinct users are distinct DO instances → distinct stores.
+    const u1 = new MeterStore()
+    const u2 = new MeterStore()
+    for (let i = 0; i < 5; i++) consume(u1, `h-${i}`)
+    expect(consume(u2, 'h-0').allowed).toBe(true)
   })
 })
 
 describe('credit metering — refinements', () => {
-  it('treats follow-up refinements as free but caps them', async () => {
-    const kv = makeMemoryKv() as unknown as KvLike
-    await consume(kv, 'u1', 'hash-x') // original import, costs 1 credit
+  it('treats follow-up refinements as free but caps them', () => {
+    const store = new MeterStore()
+    consume(store, 'hash-x') // original import, costs 1 credit
     for (let i = 0; i < MAXREF; i++) {
-      const r = await consume(kv, 'u1', 'hash-x', { isRefinement: true })
+      const r = consume(store, 'hash-x', { isRefinement: true })
       expect(r.allowed).toBe(true)
       expect(r.isRefinement).toBe(true)
     }
-    const overflow = await consume(kv, 'u1', 'hash-x', { isRefinement: true })
+    const overflow = consume(store, 'hash-x', { isRefinement: true })
     expect(overflow.allowed).toBe(false)
     expect(overflow.reason).toBe('refinement_limit')
   })
 
-  it('does not spend a credit on any refinement', async () => {
-    const kv = makeMemoryKv() as unknown as KvLike
-    await consume(kv, 'u1', 'hash-x')
-    await consume(kv, 'u1', 'hash-x', { isRefinement: true })
+  it('does not spend a credit on any refinement', () => {
+    const store = new MeterStore()
+    consume(store, 'hash-x')
+    consume(store, 'hash-x', { isRefinement: true })
     // Four more distinct originals should still be allowed (only 1 spent).
     for (let i = 0; i < 4; i++) {
-      expect((await consume(kv, 'u1', `other-${i}`)).allowed).toBe(true)
+      expect(consume(store, `other-${i}`).allowed).toBe(true)
     }
-    expect((await consume(kv, 'u1', 'one-too-many')).allowed).toBe(false)
+    expect(consume(store, 'one-too-many').allowed).toBe(false)
   })
 
-  it('reports the authoritative refinement allowance for a source hash', async () => {
-    const kv = makeMemoryKv() as unknown as KvLike
-    await consume(kv, 'u1', 'hash-x')
-    expect(await refinementUsageFor(kv, 'u1', 'hash-x', MAXREF)).toEqual({
+  it('reports the authoritative refinement allowance for a source hash', () => {
+    const store = new MeterStore()
+    consume(store, 'hash-x')
+    expect(refinementUsage(store.state('hash-x').record, MAXREF)).toEqual({
       remaining: 5,
       limit: 5,
     })
 
-    await consume(kv, 'u1', 'hash-x', { isRefinement: true })
-    await consume(kv, 'u1', 'hash-x', { isRefinement: true })
-    expect(await refinementUsageFor(kv, 'u1', 'hash-x', MAXREF)).toEqual({
+    consume(store, 'hash-x', { isRefinement: true })
+    consume(store, 'hash-x', { isRefinement: true })
+    expect(refinementUsage(store.state('hash-x').record, MAXREF)).toEqual({
       remaining: 3,
       limit: 5,
     })
+  })
+})
+
+describe('credit metering — supporter', () => {
+  it('never blocks and reports unlimited (null) remaining', () => {
+    const store = new MeterStore()
+    for (let i = 0; i < 12; i++) {
+      const r = consume(store, `hash-${i}`, { isSupporter: true })
+      expect(r.allowed).toBe(true)
+      expect(r.remaining).toBeNull()
+    }
+    expect(store.count).toBe(0) // supporters never charge
+  })
+})
+
+describe('computeCommit — idempotency + atomicity', () => {
+  it('charges a new hash at most once (re-commit is a no-op)', () => {
+    const store = new MeterStore()
+    const decision = decideCredit({
+      state: store.state('h'),
+      isSupporter: false,
+      isRefinement: false,
+      freeCredits: FREE,
+      maxRefinements: MAXREF,
+    })
+    // First commit charges.
+    const first = computeCommit({
+      decision,
+      state: store.state('h'),
+      isSupporter: false,
+      freeCredits: FREE,
+    })
+    store.apply('h', first.state)
+    expect(store.count).toBe(1)
+    // Replaying the SAME frozen decision must not double-charge (charged flag).
+    const second = computeCommit({
+      decision,
+      state: store.state('h'),
+      isSupporter: false,
+      freeCredits: FREE,
+    })
+    store.apply('h', second.state)
+    expect(store.count).toBe(1)
+    expect(second.remaining).toBe(4)
+  })
+
+  it('never loses an increment when commits are serialized (bounded overage)', () => {
+    // Simulate a concurrent burst: 4 credits already spent, cap allows 2 more
+    // distinct-hash imports in flight. BOTH pass the pre-flight gate on the same
+    // stale count (4 < 5). With the atomic DO, their commits run serialized —
+    // each reads fresh state — so BOTH increments land (5 then 6): no lost write
+    // (the old KV read-modify-write would have dropped one). The residual is a
+    // BOUNDED overage of at most cap-1 past the free limit, by design.
+    const store = new MeterStore()
+    for (let i = 0; i < 4; i++) consume(store, `seed-${i}`)
+    expect(store.count).toBe(4)
+
+    const dA = decideCredit({
+      state: { count: 4, record: null },
+      isSupporter: false,
+      isRefinement: false,
+      freeCredits: FREE,
+      maxRefinements: MAXREF,
+    })
+    const dB = decideCredit({
+      state: { count: 4, record: null },
+      isSupporter: false,
+      isRefinement: false,
+      freeCredits: FREE,
+      maxRefinements: MAXREF,
+    })
+    expect(dA.allowed && dB.allowed).toBe(true)
+
+    // Serialized commits (the DO's single thread), each reading fresh state.
+    const a = computeCommit({
+      decision: dA,
+      state: store.state('a'),
+      isSupporter: false,
+      freeCredits: FREE,
+    })
+    store.apply('a', a.state)
+    const b = computeCommit({
+      decision: dB,
+      state: store.state('b'),
+      isSupporter: false,
+      freeCredits: FREE,
+    })
+    store.apply('b', b.state)
+
+    expect(store.count).toBe(6) // both landed — no lost increment
+    // The next NEW hash is now correctly denied.
+    expect(consume(store, 'c').allowed).toBe(false)
   })
 })
 
@@ -123,49 +232,39 @@ describe('kickoff credits snapshot', () => {
    * The two must be identical — that's the whole contract: showing the meter at
    * kickoff must not flicker when `done` lands.
    */
-  const gateThenSettle = async (
-    kv: KvLike,
-    uuid: string,
+  const gateThenSettle = (
+    store: MeterStore,
     hash: string,
-    opts: {
-      supporter?: boolean
-      unmetered?: boolean
-      isRefinement?: boolean
-    } = {}
+    opts: { supporter?: boolean; unmetered?: boolean; isRefinement?: boolean } = {}
   ) => {
     const supporter = opts.supporter ?? false
     // Route passes `unmetered` (supporter OR dev bypass) to the gate + recorder.
     const unmetered = opts.unmetered ?? supporter
     const isRefinement = opts.isRefinement ?? false
-    const decision = await checkCredit({
-      kv,
-      uuid,
-      hash,
+    const decision = decideCredit({
+      state: store.state(hash),
       isSupporter: unmetered,
       isRefinement,
       freeCredits: FREE,
       maxRefinements: MAXREF,
     })
     expect(decision.allowed).toBe(true)
-    const atKickoff = await kickoffCredits({
-      kv,
-      uuid,
-      hash,
+    const atKickoff = computeKickoffCredits({
       decision,
+      record: store.state(hash).record,
       isSupporter: supporter,
       unmetered,
       freeCredits: FREE,
       maxRefinements: MAXREF,
     })
-    const remaining = await recordUsage({
-      kv,
-      uuid,
-      hash,
-      isSupporter: unmetered,
+    const { state: next, remaining } = computeCommit({
       decision,
+      state: store.state(hash),
+      isSupporter: unmetered,
       freeCredits: FREE,
     })
-    const refinements = await refinementUsageFor(kv, uuid, hash, MAXREF)
+    store.apply(hash, next)
+    const refinements = refinementUsage(store.state(hash).record, MAXREF)
     const atDone = {
       remaining,
       limit: unmetered ? null : FREE,
@@ -175,9 +274,9 @@ describe('kickoff credits snapshot', () => {
     return { atKickoff, atDone }
   }
 
-  it('matches the done snapshot for a new import', async () => {
-    const kv = makeMemoryKv() as unknown as KvLike
-    const { atKickoff, atDone } = await gateThenSettle(kv, 'u1', 'hash-new')
+  it('matches the done snapshot for a new import', () => {
+    const store = new MeterStore()
+    const { atKickoff, atDone } = gateThenSettle(store, 'hash-new')
     expect(atKickoff).toEqual({
       remaining: 4,
       limit: 5,
@@ -187,10 +286,10 @@ describe('kickoff credits snapshot', () => {
     expect(atKickoff).toEqual(atDone)
   })
 
-  it('folds in the pending refinement so it matches the done snapshot', async () => {
-    const kv = makeMemoryKv() as unknown as KvLike
-    await consume(kv, 'u1', 'hash-x') // original import
-    const { atKickoff, atDone } = await gateThenSettle(kv, 'u1', 'hash-x', {
+  it('folds in the pending refinement so it matches the done snapshot', () => {
+    const store = new MeterStore()
+    consume(store, 'hash-x') // original import
+    const { atKickoff, atDone } = gateThenSettle(store, 'hash-x', {
       isRefinement: true,
     })
     // The credit isn't re-spent (4 left), and the refinement allowance already
@@ -204,17 +303,17 @@ describe('kickoff credits snapshot', () => {
     expect(atKickoff).toEqual(atDone)
   })
 
-  it('leaves the refinement count untouched for a free replay', async () => {
-    const kv = makeMemoryKv() as unknown as KvLike
-    await consume(kv, 'u1', 'hash-x')
-    const { atKickoff, atDone } = await gateThenSettle(kv, 'u1', 'hash-x')
+  it('leaves the refinement count untouched for a free replay', () => {
+    const store = new MeterStore()
+    consume(store, 'hash-x')
+    const { atKickoff, atDone } = gateThenSettle(store, 'hash-x')
     expect(atKickoff.refinements).toEqual({ remaining: 5, limit: 5 })
     expect(atKickoff).toEqual(atDone)
   })
 
-  it('reports unlimited for a real supporter', async () => {
-    const kv = makeMemoryKv() as unknown as KvLike
-    const { atKickoff, atDone } = await gateThenSettle(kv, 'sup', 'hash-s', {
+  it('reports unlimited for a real supporter', () => {
+    const store = new MeterStore()
+    const { atKickoff, atDone } = gateThenSettle(store, 'hash-s', {
       supporter: true,
     })
     expect(atKickoff).toEqual({
@@ -226,9 +325,9 @@ describe('kickoff credits snapshot', () => {
     expect(atKickoff).toEqual(atDone)
   })
 
-  it('keeps isSupporter false for an unmetered dev bypass', async () => {
-    const kv = makeMemoryKv() as unknown as KvLike
-    const { atKickoff, atDone } = await gateThenSettle(kv, 'dev', 'hash-d', {
+  it('keeps isSupporter false for an unmetered dev bypass', () => {
+    const store = new MeterStore()
+    const { atKickoff, atDone } = gateThenSettle(store, 'hash-d', {
       supporter: false,
       unmetered: true,
     })
@@ -239,16 +338,5 @@ describe('kickoff credits snapshot', () => {
       refinements: { remaining: 5, limit: 5 },
     })
     expect(atKickoff).toEqual(atDone)
-  })
-})
-
-describe('credit metering — supporter', () => {
-  it('never blocks and reports unlimited (null) remaining', async () => {
-    const kv = makeMemoryKv() as unknown as KvLike
-    for (let i = 0; i < 12; i++) {
-      const r = await consume(kv, 'sup', `hash-${i}`, { isSupporter: true })
-      expect(r.allowed).toBe(true)
-      expect(r.remaining).toBeNull()
-    }
   })
 })

@@ -22,8 +22,9 @@ export interface Environment {
 
   /**
    * KV namespace backing Notes Import. Stores ONLY non-content metadata:
-   * App Attest challenges + device keys, and per-identity usage counters
-   * (`{hash → counter}`). Never notes text or model output (ADR 0008).
+   * App Attest challenges + device keys, and short-lived SSE subscribe tokens.
+   * Never notes text or model output (ADR 0008). The per-identity credit meter
+   * moved OUT of KV into the `NotesImportIndex` DO (atomic, strongly consistent).
    */
   NOTES_KV: KVNamespace;
 
@@ -36,8 +37,9 @@ export interface Environment {
   >;
 
   /**
-   * Per-user Durable Object: enforces the N-concurrent-imports cap and backs the
-   * app's active-imports list (one instance per install uuid).
+   * Per-user Durable Object (one instance per install uuid): enforces the
+   * N-concurrent-imports cap, backs the app's active-imports list, and owns the
+   * atomic free-credit meter (moved here from KV so check-then-charge can't race).
    */
   NOTES_IMPORT_INDEX: DurableObjectNamespace<
     import('./notesImport/indexDO').NotesImportIndex

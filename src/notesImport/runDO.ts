@@ -3,11 +3,7 @@ import type { Environment } from '../types'
 import { getNotesImportConfig } from './config'
 import { decideStartOutcome, type StartOutcome } from './cap'
 import { runNotesImportModel, type ModelProgress } from './llm'
-import {
-  recordUsage,
-  refinementUsageFor,
-  type CreditDecision,
-} from '../credits'
+import type { CreditDecision } from '../credits'
 import {
   formatSSE,
   isTerminalEvent,
@@ -277,21 +273,19 @@ export class NotesImportRun extends DurableObject<Environment> {
       this.#flushReason()
 
       // Spend the credit only now that the model succeeded (mirrors the legacy
-      // path: a failure never costs the user a credit).
-      const remaining = await recordUsage({
-        kv: this.env.NOTES_KV,
-        uuid: input.uuid,
-        hash: input.contentHash,
-        isSupporter: input.unmetered ?? input.isSupporter,
-        decision: input.decision,
-        freeCredits: config.freeCredits,
-      })
-      const refinements = await refinementUsageFor(
-        this.env.NOTES_KV,
-        input.uuid,
-        input.contentHash,
-        config.maxRefinements
-      )
+      // path: a failure never costs the user a credit). Commit atomically in the
+      // per-user index DO — the same single-threaded DO that gated the kickoff —
+      // so check-then-charge can't race and increments are never lost.
+      const idxId = this.env.NOTES_IMPORT_INDEX.idFromName(input.uuid)
+      const { remaining, refinements } = await this.env.NOTES_IMPORT_INDEX
+        .get(idxId)
+        .recordUsage({
+          hash: input.contentHash,
+          isSupporter: input.unmetered ?? input.isSupporter,
+          decision: input.decision,
+          freeCredits: config.freeCredits,
+          maxRefinements: config.maxRefinements,
+        })
 
       const payload: NotesImportSuccess = {
         result: out.result,
