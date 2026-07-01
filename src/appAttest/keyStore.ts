@@ -15,6 +15,15 @@ export interface DeviceKeyRecord {
 
 const keyStoreKey = (keyId: string) => `key:${keyId}`
 
+/**
+ * Reverse index pinning an identity (`uuid`) to the ONE `keyId` that first
+ * attested it — the security boundary behind `verifyAttestation` (ADR 0007).
+ * First-writer-wins: once written it is never rebound automatically, so an
+ * attacker can't attest their own key to a victim's uuid. See `getUuidOwner` /
+ * `putUuidOwner`.
+ */
+const uuidOwnerKey = (uuid: string) => `uuidOwner:${uuid}`
+
 export const getKeyRecord = async (
   kv: AppAttestKv,
   keyId: string
@@ -33,3 +42,22 @@ export const putKeyRecord = (
   keyId: string,
   record: DeviceKeyRecord
 ): Promise<void> => kv.put(keyStoreKey(keyId), JSON.stringify(record))
+
+/** The keyId that owns `uuid`, or null if the identity is still unclaimed. */
+export const getUuidOwner = (
+  kv: AppAttestKv,
+  uuid: string
+): Promise<string | null> => kv.get(uuidOwnerKey(uuid))
+
+/**
+ * Pin `uuid` to `keyId` (first-writer-wins). Caller must only invoke this when
+ * the identity is unclaimed OR already owned by this same `keyId`; it never
+ * checks — the ownership decision lives in `verifyAttestation`. To manually
+ * release a binding (e.g. a legitimate Secure-Enclave key rotation), an operator
+ * deletes both `uuidOwner:<uuid>` and `key:<oldKeyId>` from KV.
+ */
+export const putUuidOwner = (
+  kv: AppAttestKv,
+  uuid: string,
+  keyId: string
+): Promise<void> => kv.put(uuidOwnerKey(uuid), keyId)
