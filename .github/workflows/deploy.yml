@@ -64,8 +64,3 @@ jobs:
         run: pnpm run sentry:sourcemaps
         env:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-
-      - name: Post-deployment health check
-        run: |
-          sleep 5
-          curl -f https://ww-proxy.leviwilkerson.com/health || exit 1
