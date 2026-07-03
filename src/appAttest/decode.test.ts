@@ -4,6 +4,7 @@ import {
   decodeAttestation,
   decodeAssertion,
   parseAuthData,
+  parseAssertionAuthData,
   AppAttestDecodeError,
 } from './decode'
 
@@ -38,6 +39,27 @@ describe('parseAuthData', () => {
 
   it('throws on truncated authData', () => {
     expect(() => parseAuthData(bytes(1, 2, 3))).toThrow(AppAttestDecodeError)
+  })
+})
+
+describe('parseAssertionAuthData', () => {
+  it('parses a real-device 37-byte assertion with the AT flag set', () => {
+    // Production devices set the AT flag (0x40) on assertion authData without
+    // appending attested-credential-data — the shape that broke prod kickoff.
+    const ad = new Uint8Array(37)
+    ad.set(Array.from({ length: 32 }, () => 0xaa), 0)
+    ad[32] = 0x40
+    new DataView(ad.buffer).setUint32(33, 3, false)
+    const parsed = parseAssertionAuthData(ad)
+    expect(parsed.signCount).toBe(3)
+    expect(parsed.flags).toBe(0x40)
+    expect(parsed.credentialId).toBeUndefined()
+  })
+
+  it('throws on truncated authData', () => {
+    expect(() => parseAssertionAuthData(bytes(1, 2, 3))).toThrow(
+      AppAttestDecodeError
+    )
   })
 })
 

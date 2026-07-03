@@ -1,5 +1,9 @@
 import { base64ToBytes, sha256Bytes } from '../crypto'
-import { decodeAssertion, parseAuthData } from './decode'
+import {
+  decodeAssertion,
+  parseAssertionAuthData,
+  type ParsedAuthData,
+} from './decode'
 import { derEcdsaSignatureToRaw } from './der'
 import { appIdRpHash, bytesEqual } from './appId'
 import { buildAssertionClientData } from './clientData'
@@ -57,12 +61,13 @@ export const verifyAssertion = async ({
   }
 
   let asn
+  let parsed: ParsedAuthData
   try {
     asn = decodeAssertion(base64ToBytes(assertion))
+    parsed = parseAssertionAuthData(asn.authenticatorData)
   } catch (e) {
     throw new AppAttestError(`malformed assertion: ${(e as Error).message}`)
   }
-  const parsed = parseAuthData(asn.authenticatorData)
 
   const expectedRpId = await appIdRpHash(teamId, bundleId)
   if (!bytesEqual(parsed.rpIdHash, expectedRpId)) {

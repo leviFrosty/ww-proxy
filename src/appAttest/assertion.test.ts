@@ -58,11 +58,11 @@ const setup = async () => {
       })
     )
 
-  const buildAuthData = async (signCount: number) => {
+  const buildAuthData = async (signCount: number, flags = 0) => {
     const rp = await appIdRpHash(TEAM, BUNDLE)
     const ad = new Uint8Array(37)
     ad.set(rp, 0)
-    ad[32] = 0
+    ad[32] = flags
     new DataView(ad.buffer).setUint32(33, signCount, false)
     return ad
   }
@@ -74,8 +74,10 @@ const setup = async () => {
     signCount: number
     /** Sign over a DIFFERENT content hash than the one we'll verify against. */
     signContentHash?: string
+    /** authData flags byte — real devices set the AT bit (0x40). */
+    flags?: number
   }) => {
-    const authData = await buildAuthData(opts.signCount)
+    const authData = await buildAuthData(opts.signCount, opts.flags ?? 0)
     const clientData = buildAssertionClientData({
       challenge: opts.challenge,
       uuid: opts.uuid,
@@ -126,6 +128,34 @@ describe('verifyAssertion (end-to-end with a synthetic Secure-Enclave key)', () 
     await expect(verify(assertion, challenge)).resolves.toBeUndefined()
     // Sign-count advanced in the stored record.
     expect(JSON.parse(kv.store.get(`key:${KEY_ID}`)!).signCount).toBe(1)
+  })
+
+  it('accepts a real-device assertion with the AT flag set on 37-byte authData', async () => {
+    const { kv, storeKey, makeAssertion, verify } = await setup()
+    await storeKey('uuid-1')
+    const challenge = await issueChallenge(kv as unknown as ChallengeKv)
+    const assertion = await makeAssertion({
+      uuid: 'uuid-1',
+      contentHash: 'hash-1',
+      challenge,
+      signCount: 1,
+      flags: 0x40,
+    })
+    await expect(verify(assertion, challenge)).resolves.toBeUndefined()
+  })
+
+  it('rejects a malformed assertion with an AppAttestError (not a 500-class throw)', async () => {
+    const { kv, storeKey, verify } = await setup()
+    await storeKey('uuid-1')
+    const challenge = await issueChallenge(kv as unknown as ChallengeKv)
+    // Valid CBOR envelope, but authenticatorData is too short to parse.
+    const cbor = encode({
+      signature: new Uint8Array([1, 2, 3]),
+      authenticatorData: new Uint8Array(10),
+    })
+    await expect(
+      verify(bytesToBase64Url(cbor), challenge)
+    ).rejects.toThrow(AppAttestError)
   })
 
   it('rejects a replayed challenge (one-time use)', async () => {

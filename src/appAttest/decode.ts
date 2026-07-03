@@ -88,13 +88,19 @@ export interface ParsedAuthData {
 }
 
 /**
- * Parses the common authenticator-data prefix and (when the AT flag is set) the
- * attested-credential-data needed for attestation. Layout:
+ * Parses only the fixed 37-byte authenticator-data prefix:
  *
  *   rpIdHash[32] | flags[1] | signCount[4 BE]
- *   ( aaguid[16] | credIdLen[2 BE] | credId[L] | coseKey[...] )?
+ *
+ * This is the parser for ASSERTIONS. Real-device App Attest assertions deviate
+ * from WebAuthn: the authData is exactly these 37 bytes but ships with the AT
+ * flag (0x40) set even though no attested-credential-data follows, so the flag
+ * must not be interpreted. Ignoring it is safe — the ES256 signature covers the
+ * raw authData bytes regardless of how much of them we parse.
  */
-export const parseAuthData = (authData: Uint8Array): ParsedAuthData => {
+export const parseAssertionAuthData = (
+  authData: Uint8Array
+): ParsedAuthData => {
   if (authData.length < 37) {
     throw new AppAttestDecodeError('authData too short')
   }
@@ -103,9 +109,27 @@ export const parseAuthData = (authData: Uint8Array): ParsedAuthData => {
     authData.byteOffset,
     authData.byteLength
   )
-  const rpIdHash = authData.subarray(0, 32)
-  const flags = authData[32]
-  const signCount = view.getUint32(33, false)
+  return {
+    rpIdHash: authData.subarray(0, 32),
+    flags: authData[32],
+    signCount: view.getUint32(33, false),
+  }
+}
+
+/**
+ * Parses the authenticator-data prefix and (when the AT flag is set) the
+ * attested-credential-data needed for ATTESTATION. Layout:
+ *
+ *   rpIdHash[32] | flags[1] | signCount[4 BE]
+ *   ( aaguid[16] | credIdLen[2 BE] | credId[L] | coseKey[...] )?
+ */
+export const parseAuthData = (authData: Uint8Array): ParsedAuthData => {
+  const { rpIdHash, flags, signCount } = parseAssertionAuthData(authData)
+  const view = new DataView(
+    authData.buffer,
+    authData.byteOffset,
+    authData.byteLength
+  )
 
   const hasAttestedCredentialData = (flags & 0x40) !== 0
   if (!hasAttestedCredentialData) {
