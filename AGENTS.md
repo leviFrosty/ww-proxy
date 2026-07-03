@@ -10,10 +10,15 @@ details, primarily the **environments**.
 
 There are two deployed Workers, defined in `wrangler.toml`:
 
-| Env  | Worker name    | URL                                          | Deploy command              |
-| ---- | -------------- | -------------------------------------------- | --------------------------- |
-| prod | `ww-proxy`     | `https://ww-proxy.leviwilkerson.com`         | `wrangler deploy`           |
-| dev  | `ww-proxy-dev` | `https://ww-proxy-dev.<subdomain>.workers.dev` | `wrangler deploy --env dev` |
+| Env  | Worker name    | URL                                          | Deploy command        |
+| ---- | -------------- | -------------------------------------------- | --------------------- |
+| prod | `ww-proxy`     | `https://ww-proxy.leviwilkerson.com`         | `pnpm run deploy`     |
+| dev  | `ww-proxy-dev` | `https://ww-proxy-dev.<subdomain>.workers.dev` | `pnpm run deploy:dev` |
+
+Prefer the `pnpm run deploy*` scripts over raw `wrangler deploy` — they also
+inject the `SENTRY_RELEASE` var and upload source maps to Sentry (see
+[Sentry source maps](#sentry-source-maps) below). CI (`.github/workflows/deploy.yml`)
+deploys prod on `v*` tags with the same source map upload.
 
 `dev` is a **fully separate Worker** — its own name, KV namespace, rate-limit
 namespace, secrets, and `workers.dev` URL. `wrangler deploy --env dev` can never
@@ -49,7 +54,7 @@ wrangler deploy --env dev
 After setup, redeploying dev is just:
 
 ```bash
-wrangler deploy --env dev
+pnpm run deploy:dev
 ```
 
 ## Local iteration (no deploy)
@@ -70,6 +75,25 @@ pnpm exec tsc --noEmit
 wrangler deploy --dry-run            # prod build
 wrangler deploy --env dev --dry-run  # dev build
 ```
+
+## Sentry source maps
+
+Errors are reported with `release: SENTRY_RELEASE` (the git commit sha,
+injected as a deploy-time var). The `pnpm run deploy` / `deploy:dev` scripts
+build with `--outdir dist` and then run `pnpm run sentry:sourcemaps`, which
+uploads `dist/` to Sentry tagged with that release so stack traces show
+original TypeScript. Org/project defaults live in `.sentryclirc` (org
+`levi-wilkerson`, project `ww-proxy`).
+
+Auth: `sentry-cli` needs `SENTRY_AUTH_TOKEN` in the environment — an org auth
+token with source map upload (`project:releases`) scope, created at
+https://levi-wilkerson.sentry.io/settings/auth-tokens/. Locally export it in
+your shell (or put it in `~/.sentryclirc`); in CI it is the `SENTRY_AUTH_TOKEN`
+repo secret. Never commit it.
+
+`wrangler.toml` also sets `upload_source_maps = true` (inherited by
+`[env.dev]`), so Cloudflare's own dashboard/tail stack traces are mapped even
+on raw `wrangler deploy`.
 
 ## Backlog
 

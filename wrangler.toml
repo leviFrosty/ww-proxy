@@ -4,6 +4,11 @@ compatibility_date = "2024-11-27"
 compatibility_flags = ["nodejs_compat"]
 workers_dev = false
 preview_urls = false
+# Generate source maps on deploy (and upload them to Cloudflare for mapped
+# stacks in dashboard/tail). Sentry gets its own copy via the package.json
+# `deploy` script: `--outdir dist` + `pnpm run sentry:sourcemaps`. Inheritable
+# key — applies to [env.dev] too.
+upload_source_maps = true
 
 # Static assets (og-image, apple-touch-icon) served directly by Cloudflare's
 # edge cache. Requests to paths matching files under `./public` are served

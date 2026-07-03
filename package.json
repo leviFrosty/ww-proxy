@@ -1,11 +1,13 @@
 {
   "name": "ww-proxy",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "HERE API proxy for Cloudflare Workers",
   "main": "src/index.ts",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "wrangler deploy --outdir dist --var SENTRY_RELEASE:$(sentry-cli releases propose-version) && pnpm run sentry:sourcemaps",
+    "deploy:dev": "wrangler deploy --env dev --outdir dist --var SENTRY_RELEASE:$(sentry-cli releases propose-version) && pnpm run sentry:sourcemaps",
+    "sentry:sourcemaps": "sentry-cli releases new $(sentry-cli releases propose-version) && sentry-cli sourcemaps upload --release=$(sentry-cli releases propose-version) --strip-prefix 'dist/..' dist",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
@@ -21,8 +23,14 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260411.1",
+    "@sentry/cli": "^3.6.0",
     "typescript": "7.0.1-rc",
     "vitest": "^4.1.9",
     "wrangler": "^4.103.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@sentry/cli"
+    ]
   }
 }
