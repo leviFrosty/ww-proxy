@@ -14,7 +14,7 @@ import {
   type NotesImportSuccess,
   type UnsequencedEvent,
 } from './events'
-import type { NotesImportContext } from './schema'
+import { isEmptyImportResult, type NotesImportContext } from './schema'
 
 /**
  * Everything the kickoff handler hands the run DO. All fields are
@@ -283,20 +283,24 @@ export class NotesImportRun extends DurableObject<Environment> {
       // per-user index DO — the same single-threaded DO that gated the kickoff —
       // so check-then-charge can't race and increments are never lost.
       const idxId = this.env.NOTES_IMPORT_INDEX.idFromName(input.uuid)
-      const { remaining, refinements } = await this.env.NOTES_IMPORT_INDEX
-        .get(idxId)
+      const { remaining, refinements, emptyCharged } = await this.env
+        .NOTES_IMPORT_INDEX.get(idxId)
         .recordUsage({
           hash: input.contentHash,
           isSupporter: input.unmetered ?? input.isSupporter,
           decision: input.decision,
           freeCredits: config.freeCredits,
           maxRefinements: config.maxRefinements,
+          isEmpty: isEmptyImportResult(out.result),
+          emptyWindowSeconds: config.emptyWindowSeconds,
+          emptyWindowLimit: config.emptyWindowLimit,
         })
 
       const payload: NotesImportSuccess = {
         result: out.result,
         contentHash: input.contentHash,
         refinement: !!input.refinement,
+        emptyCharged,
         credits: {
           remaining,
           limit:

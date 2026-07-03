@@ -174,11 +174,32 @@ export const computeKickoffCredits = ({
   }
 }
 
+/**
+ * Empty-import anti-abuse grace (see {@link computeCommit}). An Empty Import — a
+ * successful run that produced ZERO records — should not spend an Import Credit,
+ * so a User's credits are never wasted on a paste that yields nothing. But each
+ * empty run still costs a real (paid) model call, so the grace is bounded: past
+ * a rolling-window limit of empty runs, they charge again (soft degrade).
+ */
+export interface EmptyGrace {
+  /** The model produced no records (mirrors the client's `isEmptyPreview`). */
+  isEmpty: boolean
+  /** Empty runs already logged in the rolling window, BEFORE this one. */
+  countInWindow: number
+  /** Free empty runs allowed per window before the soft degrade. */
+  limit: number
+}
+
 export interface CommitCreditArgs {
   decision: CreditDecision
   state: CreditState
   isSupporter: boolean
   freeCredits: number
+  /**
+   * Empty-import grace. Absent (or `isEmpty: false`) models a normal run that
+   * charges per the usual rules — so existing non-empty callers pass nothing.
+   */
+  empty?: EmptyGrace
 }
 
 export interface CommitCreditResult {
@@ -186,6 +207,19 @@ export interface CommitCreditResult {
   state: CreditState
   /** Credits remaining after the commit (`null` for Supporters). */
   remaining: number | null
+  /**
+   * The run produced no records but STILL charged a credit because the rolling
+   * empty-run window was already exhausted (soft degrade). Drives the client's
+   * "this empty one counted" Scribe notice. False for a normal charge and for a
+   * within-window free empty.
+   */
+  emptyCharged: boolean
+  /**
+   * This run consumed one of the free empty-run allowances, so the caller must
+   * append its timestamp to the window log. Only true for an Empty Import that
+   * would otherwise have charged (never for supporters/refinements/replays).
+   */
+  recordsEmptyRun: boolean
 }
 
 /**
@@ -210,8 +244,40 @@ export const computeCommit = ({
   state,
   isSupporter,
   freeCredits,
+  empty,
 }: CommitCreditArgs): CommitCreditResult => {
   const { count, record } = state
+
+  // Empty-import anti-abuse grace. It only matters when a credit would OTHERWISE
+  // be charged — a brand-new, non-supporter, not-yet-charged hash. Supporters,
+  // refinements and replays never charge, so an empty result there saves nothing
+  // and needs no window bookkeeping.
+  const wouldCharge = decision.isNewHash && !isSupporter && !record?.charged
+  if (empty?.isEmpty && wouldCharge) {
+    if (empty.countInWindow < empty.limit) {
+      // Within the window → the empty run is free. Charge nothing and DON'T
+      // record the hash (so a later re-paste of corrected text flows through as a
+      // fresh, chargeable import); only log the run against the rolling window.
+      return {
+        state,
+        remaining: clampRemaining(count, freeCredits),
+        emptyCharged: false,
+        recordsEmptyRun: true,
+      }
+    }
+    // Window exhausted → soft degrade: charge exactly as a normal new hash would,
+    // but flag it so the client tells the user, and still log the run.
+    const nextCount = count + 1
+    return {
+      state: {
+        count: nextCount,
+        record: { charged: true, refinements: record?.refinements ?? 0 },
+      },
+      remaining: clampRemaining(nextCount, freeCredits),
+      emptyCharged: true,
+      recordsEmptyRun: true,
+    }
+  }
 
   if (decision.isNewHash) {
     if (isSupporter) {
@@ -220,12 +286,19 @@ export const computeCommit = ({
       return {
         state: { count, record: record ?? { charged: false, refinements: 0 } },
         remaining: null,
+        emptyCharged: false,
+        recordsEmptyRun: false,
       }
     }
     // Idempotency guard: charge a given hash at most once. If it's already
     // charged (a re-commit / replay), leave the count untouched.
     if (record?.charged) {
-      return { state, remaining: clampRemaining(count, freeCredits) }
+      return {
+        state,
+        remaining: clampRemaining(count, freeCredits),
+        emptyCharged: false,
+        recordsEmptyRun: false,
+      }
     }
     const nextCount = count + 1
     return {
@@ -234,6 +307,8 @@ export const computeCommit = ({
         record: { charged: true, refinements: record?.refinements ?? 0 },
       },
       remaining: clampRemaining(nextCount, freeCredits),
+      emptyCharged: false,
+      recordsEmptyRun: false,
     }
   }
 
@@ -245,9 +320,16 @@ export const computeCommit = ({
         record: { charged: base.charged, refinements: base.refinements + 1 },
       },
       remaining: isSupporter ? null : clampRemaining(count, freeCredits),
+      emptyCharged: false,
+      recordsEmptyRun: false,
     }
   }
 
   // Free replay of a known hash — no state change.
-  return { state, remaining: isSupporter ? null : clampRemaining(count, freeCredits) }
+  return {
+    state,
+    remaining: isSupporter ? null : clampRemaining(count, freeCredits),
+    emptyCharged: false,
+    recordsEmptyRun: false,
+  }
 }

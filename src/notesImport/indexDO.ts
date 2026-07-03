@@ -42,12 +42,20 @@ export interface RecordUsageArgs {
   decision: CreditDecision
   freeCredits: number
   maxRefinements: number
+  /** The model produced no records (an Empty Import) — skip the charge (ADR 0012). */
+  isEmpty: boolean
+  /** Rolling window (seconds) over which free Empty Imports are counted. */
+  emptyWindowSeconds: number
+  /** Free Empty Imports allowed per window before they charge again. */
+  emptyWindowLimit: number
 }
 
 /** What a commit returns for the client's usage meter. */
 export interface RecordUsageResult {
   remaining: number | null
   refinements: RefinementUsage
+  /** An empty run charged a credit anyway (window exhausted) — drives the Scribe notice. */
+  emptyCharged: boolean
 }
 
 /** Read-only kickoff snapshot inputs (mirrors {@link RecordUsageArgs} but no write). */
@@ -97,6 +105,12 @@ export class NotesImportIndex extends DurableObject<Environment> {
          charged     INTEGER NOT NULL,
          refinements INTEGER NOT NULL
        )`
+    )
+    // Rolling-window log of free Empty Imports (ADR 0012). One row per empty run
+    // that consumed a free allowance; pruned to the window on every write so it
+    // never accumulates. Only its COUNT within the window is read.
+    ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS empty_run (ts INTEGER NOT NULL)`
     )
   }
 
@@ -157,18 +171,30 @@ export class NotesImportIndex extends DurableObject<Environment> {
    * remaining plus the post-commit refinement allowance for the response body.
    */
   recordUsage(args: RecordUsageArgs): RecordUsageResult {
+    const now = Date.now()
+    const windowStart = now - args.emptyWindowSeconds * 1000
     const state = this.#creditState(args.hash)
-    const { state: next, remaining } = computeCommit({
+    const commit = computeCommit({
       decision: args.decision,
       state,
       isSupporter: args.isSupporter,
       freeCredits: args.freeCredits,
+      empty: {
+        isEmpty: args.isEmpty,
+        countInWindow: this.#countEmptyRuns(windowStart),
+        limit: args.emptyWindowLimit,
+      },
     })
-    if (next.count !== state.count) this.#setCount(next.count)
-    if (next.record) this.#writeRecord(args.hash, next.record)
+    if (commit.recordsEmptyRun) {
+      this.#recordEmptyRun(now)
+      this.#pruneEmptyRuns(windowStart)
+    }
+    if (commit.state.count !== state.count) this.#setCount(commit.state.count)
+    if (commit.state.record) this.#writeRecord(args.hash, commit.state.record)
     return {
-      remaining,
-      refinements: refinementUsage(next.record, args.maxRefinements),
+      remaining: commit.remaining,
+      refinements: refinementUsage(commit.state.record, args.maxRefinements),
+      emptyCharged: commit.emptyCharged,
     }
   }
 
@@ -243,5 +269,21 @@ export class NotesImportIndex extends DurableObject<Environment> {
       record.charged ? 1 : 0,
       record.refinements
     )
+  }
+
+  /** Empty runs logged within the rolling window (`ts` strictly after `since`). */
+  #countEmptyRuns(since: number): number {
+    return this.ctx.storage.sql
+      .exec<{ n: number }>('SELECT COUNT(*) AS n FROM empty_run WHERE ts > ?', since)
+      .one().n
+  }
+
+  #recordEmptyRun(ts: number): void {
+    this.ctx.storage.sql.exec('INSERT INTO empty_run (ts) VALUES (?)', ts)
+  }
+
+  /** Drop rows that have aged out of the window (`ts` at or before `before`). */
+  #pruneEmptyRuns(before: number): void {
+    this.ctx.storage.sql.exec('DELETE FROM empty_run WHERE ts <= ?', before)
   }
 }

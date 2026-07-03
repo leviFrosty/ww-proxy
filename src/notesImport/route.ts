@@ -13,7 +13,7 @@ import {
   verifyAttestation,
   AppAttestError,
 } from '../appAttest'
-import type { NotesImportContext } from './schema'
+import { isEmptyImportResult, type NotesImportContext } from './schema'
 
 const err = (
   ctx: AppContext,
@@ -741,19 +741,24 @@ export async function handleNotesImportRequest(ctx: AppContext) {
       )
     }
 
-    // Charge only now that the model succeeded — atomic in the index DO.
-    const { remaining, refinements } = await idx.recordUsage({
+    // Charge only now that the model succeeded — atomic in the index DO. An Empty
+    // Import skips the charge within the rolling window (ADR 0012).
+    const { remaining, refinements, emptyCharged } = await idx.recordUsage({
       hash: contentHash,
       isSupporter: unmetered,
       decision,
       freeCredits: config.freeCredits,
       maxRefinements: config.maxRefinements,
+      isEmpty: isEmptyImportResult(output.result),
+      emptyWindowSeconds: config.emptyWindowSeconds,
+      emptyWindowLimit: config.emptyWindowLimit,
     })
 
     return ctx.json({
       result: output.result,
       contentHash,
       refinement: isRefinement,
+      emptyCharged,
       credits: {
         remaining,
         limit: unmetered ? null : config.freeCredits,

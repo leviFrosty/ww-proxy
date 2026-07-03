@@ -35,6 +35,15 @@ export interface NotesImportConfig {
   maxOutputTokens: number
   freeCredits: number
   maxRefinements: number
+  /**
+   * Rolling window (seconds) over which free Empty Imports are counted. An Empty
+   * Import (a run that produced no records) doesn't spend a credit, but each still
+   * costs a real model call — so only {@link emptyWindowLimit} of them are free
+   * within this window before they charge again (ADR 0012). Default 7 days.
+   */
+  emptyWindowSeconds: number
+  /** Free Empty Imports allowed per {@link emptyWindowSeconds} before soft degrade. Default 5. */
+  emptyWindowLimit: number
   entitlementId: string
   devBypassToken: string | null
   /**
@@ -86,6 +95,8 @@ const DEFAULTS = {
   maxOutputTokens: 16_000,
   freeCredits: 5,
   maxRefinements: 5,
+  emptyWindowSeconds: 7 * 24 * 60 * 60,
+  emptyWindowLimit: 5,
   entitlementId: 'Supporter',
   activeImportCap: 2,
   activeImportCapSupporter: 5,
@@ -148,6 +159,14 @@ export const getNotesImportConfig = (env: Environment): NotesImportConfig => ({
   maxRefinements: intOr(
     env.NOTES_IMPORT_MAX_REFINEMENTS,
     DEFAULTS.maxRefinements
+  ),
+  emptyWindowSeconds: intOr(
+    env.NOTES_IMPORT_EMPTY_WINDOW_SECONDS,
+    DEFAULTS.emptyWindowSeconds
+  ),
+  emptyWindowLimit: intOr(
+    env.NOTES_IMPORT_EMPTY_WINDOW_LIMIT,
+    DEFAULTS.emptyWindowLimit
   ),
   entitlementId:
     env.REVENUECAT_ENTITLEMENT_ID?.trim() || DEFAULTS.entitlementId,

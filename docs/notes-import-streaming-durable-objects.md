@@ -166,6 +166,17 @@ client, the manager's `remove(hash)` fires this best-effort before forgetting an
 in-flight row; "edit & resend" then submits the edited prompt as a clean new
 import.
 
+**Empty Imports (ADR 0012):** a successful run that produced ZERO records
+(`isEmptyImportResult`, the server mirror of the client's `isEmptyPreview`) does
+not spend an Import Credit — `recordUsage` sees `isEmpty: true` and, within a
+rolling window (`emptyWindowSeconds`/`emptyWindowLimit`, default 5 per 7 days,
+tracked in the index DO's `empty_run` table), returns the credit untouched and
+records no `hash_record` row (so a later re-paste of corrected text still flows as
+a fresh, chargeable import). Past the window it charges again (soft degrade) and
+sets `emptyCharged: true` on the `done` payload, which the client turns into a
+fixed Scribe AI notice. Supporters are unmetered and exempt from the window
+entirely.
+
 **One-time deploy:** the new SQLite DO classes need the `v1` migration applied —
 `wrangler deploy` (prod) and `wrangler deploy --env dev` pick it up from
 `[[migrations]]` / `[[env.dev.migrations]]`. No new secrets.

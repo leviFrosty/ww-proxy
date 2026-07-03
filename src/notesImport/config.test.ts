@@ -13,6 +13,8 @@ describe('getNotesImportConfig', () => {
     expect(cfg.maxOutputTokens).toBe(16_000)
     expect(cfg.freeCredits).toBe(5)
     expect(cfg.maxRefinements).toBe(5)
+    expect(cfg.emptyWindowSeconds).toBe(604_800) // 7 days
+    expect(cfg.emptyWindowLimit).toBe(5)
     expect(cfg.entitlementId).toBe('Supporter')
     expect(cfg.devBypassToken).toBeNull()
     // No dev-bypass token ⇒ prod ⇒ require production attestations.
@@ -44,12 +46,16 @@ describe('getNotesImportConfig', () => {
       NOTES_IMPORT_PROVIDERS: 'fireworks, deepinfra ,, baseten',
       NOTES_IMPORT_MAX_CHARS: '250000',
       NOTES_IMPORT_FREE_CREDITS: '3',
+      NOTES_IMPORT_EMPTY_WINDOW_SECONDS: '86400',
+      NOTES_IMPORT_EMPTY_WINDOW_LIMIT: '3',
       NOTES_IMPORT_DEV_BYPASS_TOKEN: 'tok',
     } as Environment)
     expect(cfg.model).toBe('fireworks/some-model')
     expect(cfg.providers).toEqual(['fireworks', 'deepinfra', 'baseten'])
     expect(cfg.maxChars).toBe(250_000)
     expect(cfg.freeCredits).toBe(3)
+    expect(cfg.emptyWindowSeconds).toBe(86_400)
+    expect(cfg.emptyWindowLimit).toBe(3)
     expect(cfg.devBypassToken).toBe('tok')
   })
 

@@ -35,6 +35,14 @@ export interface NotesImportSuccess {
   result: NotesImportResult
   contentHash: string
   refinement: boolean
+  /**
+   * The run produced no records (an Empty Import) AND still charged an Import
+   * Credit because the rolling free-empty window was exhausted (ADR 0012). The
+   * client shows a fixed Scribe AI notice when this is true; a within-window free
+   * empty (or any non-empty run) leaves it false. Absent on older payloads →
+   * treat as false.
+   */
+  emptyCharged: boolean
   credits: {
     remaining: number | null
     limit: number | null
