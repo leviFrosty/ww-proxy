@@ -164,6 +164,20 @@ export interface NotesImportResult {
 }
 
 /**
+ * An "Empty Import": a run that completed fine but produced ZERO records. This is
+ * the SERVER mirror of witness-work's `isEmptyPreview`
+ * (`src/features/notes-import/lib/buildNotesImportPreview.ts`) — the two predicates
+ * MUST stay identical, since the client uses it to render the empty preview and
+ * the server uses it to skip the credit charge (ADR 0012). A detected Publisher
+ * counts as a real record; produced Categories and Warnings alone do not.
+ */
+export const isEmptyImportResult = (result: NotesImportResult): boolean =>
+  result.contacts.length === 0 &&
+  result.visits.length === 0 &&
+  result.timeEntries.length === 0 &&
+  result.publisher == null
+
+/**
  * JSON Schema for the model's structured output. Passed to `generateObject`
  * (via `jsonSchema`) so the model is forced to return exactly this shape and
  * retries on a mismatch — no brittle text parsing.

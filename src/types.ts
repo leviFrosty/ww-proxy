@@ -89,6 +89,12 @@ export interface Environment {
   /** Max stateless follow-up refinements per content hash. Default 5. */
   NOTES_IMPORT_MAX_REFINEMENTS?: string;
 
+  /** Rolling window (seconds) for counting free Empty Imports. Default 604800 (7d). */
+  NOTES_IMPORT_EMPTY_WINDOW_SECONDS?: string;
+
+  /** Free Empty Imports per window before they charge a credit again. Default 5. */
+  NOTES_IMPORT_EMPTY_WINDOW_LIMIT?: string;
+
   /** Max concurrent in-flight imports per identity (non-Supporter). Default 2. */
   NOTES_IMPORT_ACTIVE_CAP?: string;
 

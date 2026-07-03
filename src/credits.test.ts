@@ -225,6 +225,132 @@ describe('computeCommit — idempotency + atomicity', () => {
   })
 })
 
+describe('empty-import grace (ADR 0012)', () => {
+  const newHashDecision = (store: MeterStore, hash: string): CreditDecision =>
+    decideCredit({
+      state: store.state(hash),
+      isSupporter: false,
+      isRefinement: false,
+      freeCredits: FREE,
+      maxRefinements: MAXREF,
+    })
+
+  it('does not charge a within-window empty, but flags it to be logged', () => {
+    const store = new MeterStore()
+    const decision = newHashDecision(store, 'h')
+    const commit = computeCommit({
+      decision,
+      state: store.state('h'),
+      isSupporter: false,
+      freeCredits: FREE,
+      empty: { isEmpty: true, countInWindow: 0, limit: 5 },
+    })
+    expect(commit.emptyCharged).toBe(false)
+    expect(commit.recordsEmptyRun).toBe(true)
+    expect(commit.remaining).toBe(5) // untouched — no credit spent
+    store.apply('h', commit.state)
+    expect(store.count).toBe(0)
+    expect(store.records.size).toBe(0) // the empty hash is NOT recorded
+  })
+
+  it('charges an empty once the window is exhausted (soft degrade)', () => {
+    const store = new MeterStore()
+    const decision = newHashDecision(store, 'h')
+    const commit = computeCommit({
+      decision,
+      state: store.state('h'),
+      isSupporter: false,
+      freeCredits: FREE,
+      empty: { isEmpty: true, countInWindow: 5, limit: 5 },
+    })
+    expect(commit.emptyCharged).toBe(true)
+    expect(commit.recordsEmptyRun).toBe(true)
+    expect(commit.remaining).toBe(4) // charged like a normal new hash
+    store.apply('h', commit.state)
+    expect(store.count).toBe(1)
+  })
+
+  it('gives 5 free empties then charges the 6th, keeping the hashes unrecorded', () => {
+    // Mirror the DO's recordUsage loop over a stream of DISTINCT empty pastes.
+    const store = new MeterStore()
+    let windowRuns = 0
+    const runEmpty = (hash: string) => {
+      const decision = newHashDecision(store, hash)
+      expect(decision.allowed).toBe(true) // empties never deplete credits → never gate
+      const commit = computeCommit({
+        decision,
+        state: store.state(hash),
+        isSupporter: false,
+        freeCredits: FREE,
+        empty: { isEmpty: true, countInWindow: windowRuns, limit: 5 },
+      })
+      if (commit.recordsEmptyRun) windowRuns++
+      store.apply(hash, commit.state)
+      return commit
+    }
+    for (let i = 0; i < 5; i++) expect(runEmpty(`empty-${i}`).emptyCharged).toBe(false)
+    expect(store.count).toBe(0) // nothing charged across 5 free empties
+    expect(store.records.size).toBe(0) // and none recorded → a re-paste flows fresh
+
+    const sixth = runEmpty('empty-5')
+    expect(sixth.emptyCharged).toBe(true)
+    expect(store.count).toBe(1)
+  })
+
+  it('never applies the grace to a supporter (nothing to save)', () => {
+    const store = new MeterStore()
+    const decision = decideCredit({
+      state: store.state('h'),
+      isSupporter: true,
+      isRefinement: false,
+      freeCredits: FREE,
+      maxRefinements: MAXREF,
+    })
+    const commit = computeCommit({
+      decision,
+      state: store.state('h'),
+      isSupporter: true,
+      freeCredits: FREE,
+      empty: { isEmpty: true, countInWindow: 0, limit: 5 },
+    })
+    expect(commit.recordsEmptyRun).toBe(false)
+    expect(commit.emptyCharged).toBe(false)
+    expect(commit.remaining).toBeNull()
+  })
+
+  it('never applies the grace to a refinement or a replay', () => {
+    const store = new MeterStore()
+    consume(store, 'h') // charge the original
+    const refDecision = decideCredit({
+      state: store.state('h'),
+      isSupporter: false,
+      isRefinement: true,
+      freeCredits: FREE,
+      maxRefinements: MAXREF,
+    })
+    const refCommit = computeCommit({
+      decision: refDecision,
+      state: store.state('h'),
+      isSupporter: false,
+      freeCredits: FREE,
+      empty: { isEmpty: true, countInWindow: 0, limit: 5 },
+    })
+    expect(refCommit.recordsEmptyRun).toBe(false) // refinements never charge anyway
+
+    // A replay of the already-charged hash must not be double-charged nor logged.
+    const replayDecision = newHashDecision(store, 'h') // record exists but isNewHash=false
+    const replayCommit = computeCommit({
+      decision: replayDecision,
+      state: store.state('h'),
+      isSupporter: false,
+      freeCredits: FREE,
+      empty: { isEmpty: true, countInWindow: 0, limit: 5 },
+    })
+    expect(replayCommit.recordsEmptyRun).toBe(false)
+    expect(replayCommit.emptyCharged).toBe(false)
+  })
+})
+
 describe('kickoff credits snapshot', () => {
   /**
    * Gate, snapshot the credits as the kickoff returns them (read-only,
