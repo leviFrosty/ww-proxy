@@ -37,6 +37,9 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           packageManager: pnpm
+          # --outdir keeps the bundled worker + source map on disk so the
+          # Sentry upload step below can pick them up.
+          command: deploy --outdir dist
           secrets: |
             HERE_API_KEY
             SENTRY_DSN
@@ -45,6 +48,7 @@ jobs:
           vars: |
             APP_VERSION
             COMMIT_SHA
+            SENTRY_RELEASE
         env:
           HERE_API_KEY: ${{ secrets.HERE_API_KEY }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
@@ -52,6 +56,14 @@ jobs:
           REVENUECAT_API_KEY: ${{ secrets.REVENUECAT_API_KEY }}
           APP_VERSION: ${{ steps.meta.outputs.version }}
           COMMIT_SHA: ${{ steps.meta.outputs.commit }}
+          # Full commit sha — matches `sentry-cli releases propose-version`,
+          # which the source map upload step tags its artifacts with.
+          SENTRY_RELEASE: ${{ github.sha }}
+
+      - name: Upload source maps to Sentry
+        run: pnpm run sentry:sourcemaps
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
 
       - name: Post-deployment health check
         run: |

@@ -4,6 +4,13 @@ export interface Environment {
   HERE_API_KEY: string;
   SENTRY_DSN: string;
   /**
+   * Release name (git commit sha) injected at deploy time via
+   * `--var SENTRY_RELEASE:$(sentry-cli releases propose-version)` so Sentry
+   * can match events to uploaded source maps. Absent under `wrangler dev`
+   * and legacy deploys that skip the flag.
+   */
+  SENTRY_RELEASE?: string;
+  /**
    * Worker Version Metadata binding. Cloudflare populates this at runtime with
    * the deployed version's `id`/`tag`/`timestamp`, so `/health` can report the
    * actual deployed build instead of a stale plaintext var. Configured under
