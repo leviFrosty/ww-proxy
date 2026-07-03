@@ -92,7 +92,12 @@ export const verifyAssertion = async ({
     contentHash,
   })
   const clientDataHash = await sha256Bytes(new TextEncoder().encode(clientData))
-  const message = concat(asn.authenticatorData, clientDataHash)
+  // Apple signs the NONCE ITSELF as the to-be-signed message — the ECDSA
+  // digest is SHA256(nonce) = SHA256(SHA256(authData || clientDataHash)), one
+  // hash layer more than WebAuthn's assertion scheme. Verified against a real
+  // device capture (see 'verifies a captured real-device assertion' test);
+  // passing `authData || clientDataHash` directly never verifies.
+  const nonce = await sha256Bytes(concat(asn.authenticatorData, clientDataHash))
 
   const verifyKey = await crypto.subtle.importKey(
     'spki',
@@ -106,7 +111,7 @@ export const verifyAssertion = async ({
     { name: 'ECDSA', hash: 'SHA-256' },
     verifyKey,
     rawSig,
-    message
+    nonce
   )
   if (!ok) throw new AppAttestError('assertion signature invalid')
 

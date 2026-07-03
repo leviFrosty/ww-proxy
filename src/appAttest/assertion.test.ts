@@ -5,7 +5,7 @@ import { AppAttestError } from './errors'
 import { issueChallenge, type ChallengeKv } from './challenge'
 import { appIdRpHash } from './appId'
 import { buildAssertionClientData } from './clientData'
-import { bytesToBase64Url, sha256Bytes } from '../crypto'
+import { base64ToBytes, bytesToBase64Url, sha256Bytes } from '../crypto'
 import { makeMemoryKv } from '../test/memoryKv'
 
 const TEAM = 'ABCDE12345'
@@ -87,12 +87,15 @@ const setup = async () => {
       contentHash: opts.signContentHash ?? opts.contentHash,
     })
     const clientDataHash = await sha256Bytes(new TextEncoder().encode(clientData))
-    const message = concat(authData, clientDataHash)
+    // Apple signs the nonce itself (digest = SHA256(nonce)), not the
+    // authData||clientDataHash message — mirror that here so these synthetic
+    // assertions exercise the same scheme real devices use.
+    const nonce = await sha256Bytes(concat(authData, clientDataHash))
     const rawSig = new Uint8Array(
       await crypto.subtle.sign(
         { name: 'ECDSA', hash: 'SHA-256' },
         pair.privateKey,
-        message
+        nonce
       )
     )
     const cbor = encode({
@@ -286,5 +289,89 @@ describe('verifyAssertion (end-to-end with a synthetic Secure-Enclave key)', () 
       signCount: 1,
     })
     await expect(verify(assertion, challenge)).rejects.toThrow(/unknown device key/)
+  })
+})
+
+describe('verifyAssertion (captured real-device fixture)', () => {
+  // Captured from prod Workers Logs on 2026-07-03 while diagnosing why real
+  // assertions never verified (Levi's own device; the challenge is long
+  // consumed, the key is public). Synthetic fixtures can't catch a wrong
+  // to-be-signed message — the test signer produces whatever the verifier
+  // expects — so this pins the verifier to what Secure Enclave hardware
+  // actually signs: the ECDSA digest is SHA256(nonce), nonce =
+  // SHA256(authData || clientDataHash).
+  const FIXTURE = {
+    teamId: 'Y3KE7B7AHJ',
+    bundleId: 'com.leviwilkerson.jwtime',
+    keyId: 'sVDPRuerjbV83x+vholYh+EwttQgP9BlbLyeZhgI+8k=',
+    uuid: '65A8B00C-DA7A-4E0A-BA5C-8E3D1B8C5F1C',
+    accountId: '65A8B00C-DA7A-4E0A-BA5C-8E3D1B8C5F1C',
+    challenge: 'Ofu3bubTCTXH-xVXg8DOfaBha2KXq9kx4q7n61fvjiE',
+    contentHash:
+      '2cd3ff6962f569cd7b328f7c7fae72ce36e6fedd5f2fd1e172c73b4156c77184',
+    spki: 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAELY66tAKMMvuOymEnOhvE6rspbpTBUOJL46iDxYK8w5A1MTJGEZSIHoI5xgRi7l33TjfYP69-2QxYLp7C45ajcQ',
+    /** 37 bytes, AT flag (0x40) set, signCount 26 — the real-device shape. */
+    authenticatorData: 'GGeAsV7N4dOwSQdAhz2pQI2VH8icOWVMZ4l-wJbm9gtAAAAAGg',
+    signatureDer:
+      'MEUCIQCL_IvSSGA3ffEKmsu0XE4ET5HVWzS1aO9cC4Pmc-cb8AIgEmYBgoJOkZVqcRSMDyDnlTEBe0-0-YtznMLEPUhOwYQ',
+  }
+
+  const seededKv = async () => {
+    const kv = makeMemoryKv()
+    await kv.put(
+      `key:${FIXTURE.keyId}`,
+      JSON.stringify({
+        spki: FIXTURE.spki,
+        signCount: 0,
+        uuid: FIXTURE.uuid,
+        environment: 'production',
+        attestedAt: 0,
+      })
+    )
+    await kv.put(`chal:${FIXTURE.challenge}`, '1')
+    return kv
+  }
+
+  const fixtureAssertion = () =>
+    bytesToBase64Url(
+      encode({
+        signature: base64ToBytes(FIXTURE.signatureDer),
+        authenticatorData: base64ToBytes(FIXTURE.authenticatorData),
+      })
+    )
+
+  it('verifies a captured real-device assertion and advances the sign count', async () => {
+    const kv = await seededKv()
+    await expect(
+      verifyAssertion({
+        kv: kv as unknown as ChallengeKv,
+        assertion: fixtureAssertion(),
+        keyId: FIXTURE.keyId,
+        challenge: FIXTURE.challenge,
+        uuid: FIXTURE.uuid,
+        accountId: FIXTURE.accountId,
+        contentHash: FIXTURE.contentHash,
+        teamId: FIXTURE.teamId,
+        bundleId: FIXTURE.bundleId,
+      })
+    ).resolves.toBeUndefined()
+    expect(JSON.parse(kv.store.get(`key:${FIXTURE.keyId}`)!).signCount).toBe(26)
+  })
+
+  it('rejects the same capture when any signed field changes', async () => {
+    const kv = await seededKv()
+    await expect(
+      verifyAssertion({
+        kv: kv as unknown as ChallengeKv,
+        assertion: fixtureAssertion(),
+        keyId: FIXTURE.keyId,
+        challenge: FIXTURE.challenge,
+        uuid: FIXTURE.uuid,
+        accountId: FIXTURE.accountId,
+        contentHash: FIXTURE.contentHash.replace(/2/g, '3'),
+        teamId: FIXTURE.teamId,
+        bundleId: FIXTURE.bundleId,
+      })
+    ).rejects.toThrow('assertion signature invalid')
   })
 })
