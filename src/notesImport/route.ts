@@ -118,6 +118,9 @@ export async function handleAttestRequest(ctx: AppContext) {
     })
   } catch (e) {
     if (e instanceof AppAttestError) {
+      // The message is otherwise only in the response body, which no log
+      // store captures — surface it in Workers Logs for field debugging.
+      console.warn('notes-import attest rejected:', e.message)
       return err(ctx, HTTP_STATUS.UNAUTHORIZED, e.message, 'attestation_failed')
     }
     Sentry.captureException(e)
@@ -127,6 +130,68 @@ export async function handleAttestRequest(ctx: AppContext) {
       'Attestation error',
       'server_error'
     )
+  }
+  return ctx.json({ ok: true })
+}
+
+/**
+ * POST /notes-import/verify — attested no-op for the app's dev-tools
+ * diagnostics. Runs the exact verifyAssertion path the metered endpoints use
+ * (challenge consumption and sign-count advance included) but touches no
+ * credits and no inference, so the Tools screen can prove the full App Attest
+ * boundary server-side. The probe `contentHash` is client-chosen; it's bound
+ * into the signed clientData like any real import's hash.
+ */
+export async function handleNotesImportVerifyRequest(ctx: AppContext) {
+  let body: Record<string, unknown>
+  try {
+    body = (await ctx.req.json()) as Record<string, unknown>
+  } catch {
+    return err(ctx, HTTP_STATUS.BAD_REQUEST, 'Invalid JSON', 'bad_request')
+  }
+
+  const uuid = asString(body.uuid)
+  const keyId = asString(body.keyId)
+  const challenge = asString(body.challenge)
+  const assertion = asString(body.assertion)
+  const contentHash = asString(body.contentHash)
+  if (!uuid || !keyId || !challenge || !assertion || !contentHash) {
+    return err(
+      ctx,
+      HTTP_STATUS.BAD_REQUEST,
+      'Missing uuid, keyId, challenge, assertion, or contentHash',
+      'bad_request'
+    )
+  }
+  // Same shape gates as kickoff: both values end up in the `|`-delimited
+  // signed clientData, so keep them to their bounded alphabets.
+  const accountId = body.accountId != null ? asString(body.accountId) : null
+  if (body.accountId != null && (!accountId || !isValidAccountId(accountId))) {
+    return err(ctx, HTTP_STATUS.BAD_REQUEST, 'Invalid accountId', 'bad_request')
+  }
+  if (!/^[a-f0-9]{64}$/.test(contentHash)) {
+    return err(ctx, HTTP_STATUS.BAD_REQUEST, 'Invalid contentHash', 'bad_request')
+  }
+
+  try {
+    await verifyAssertion({
+      kv: ctx.env.NOTES_KV,
+      assertion,
+      keyId,
+      challenge,
+      uuid,
+      accountId: accountId ?? undefined,
+      contentHash,
+      teamId: ctx.env.APPLE_TEAM_ID,
+      bundleId: ctx.env.IOS_BUNDLE_ID,
+    })
+  } catch (e) {
+    if (e instanceof AppAttestError) {
+      console.warn('notes-import verify rejected:', e.message)
+      return err(ctx, HTTP_STATUS.UNAUTHORIZED, e.message, 'attestation_failed')
+    }
+    Sentry.captureException(e)
+    return err(ctx, HTTP_STATUS.INTERNAL_SERVER_ERROR, 'Verify error', 'server_error')
   }
   return ctx.json({ ok: true })
 }
@@ -306,6 +371,9 @@ async function authenticateAndGate(
       })
     } catch (e) {
       if (e instanceof AppAttestError) {
+        // The message is otherwise only in the response body, which no log
+        // store captures — surface it in Workers Logs for field debugging.
+        console.warn('notes-import assertion rejected:', e.message)
         return {
           ok: false,
           response: err(ctx, HTTP_STATUS.UNAUTHORIZED, e.message, 'attestation_failed'),

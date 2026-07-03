@@ -12,6 +12,7 @@ import { handleAasaRequest, handleContactLinkRequest } from "./contactLink";
 import {
   handleChallengeRequest,
   handleAttestRequest,
+  handleNotesImportVerifyRequest,
   handleNotesImportRequest,
   handleNotesImportStatusRequest,
   handleNotesImportKickoffRequest,
@@ -84,6 +85,8 @@ app.get("/health", handleHealthCheckRequest);
 app.get("/notes-import/status", handleNotesImportStatusRequest);
 app.post("/notes-import/challenge", handleChallengeRequest);
 app.post("/notes-import/attest", handleAttestRequest);
+// Attested no-op: dev-tools diagnostics prove the assertion path server-side.
+app.post("/notes-import/verify", handleNotesImportVerifyRequest);
 // Streaming import: attested kickoff → SSE progress stream → result snapshot.
 app.post("/notes-import/kickoff", handleNotesImportKickoffRequest);
 app.get("/notes-import/:importId/events", handleNotesImportEventsRequest);
