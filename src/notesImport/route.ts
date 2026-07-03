@@ -48,6 +48,15 @@ const errorDetail = (e: unknown): string => {
 const asString = (v: unknown): string | null =>
   typeof v === 'string' && v.length > 0 ? v : null
 
+/**
+ * Shape gate for the client-supplied shared account id (witness-work ADR
+ * 0011). It becomes a Durable Object name, a RevenueCat app-user-id path
+ * segment, and a `|`-delimited clientData field, so keep it to a bounded
+ * uuid-ish alphabet. Install ids (the value it defaults to on-device) are
+ * `Crypto.randomUUID()` strings, which this accepts with room to spare.
+ */
+const isValidAccountId = (s: string): boolean => /^[A-Za-z0-9_-]{8,64}$/.test(s)
+
 const subKey = (token: string) => `notes-import:sub:${token}`
 
 /**
@@ -124,6 +133,8 @@ export async function handleAttestRequest(ctx: AppContext) {
 
 interface NotesImportBody {
   uuid: string
+  /** Shared account id (ADR 0011); absent on pre-account clients. */
+  accountId?: string
   notesText: string
   contentHash: string
   context: NotesImportContext
@@ -138,6 +149,16 @@ interface GateOk {
   ok: true
   body: NotesImportBody
   uuid: string
+  /**
+   * The identity everything per-user keys on: the shared account id when the
+   * client sent one, else the per-device install uuid (old clients). Names
+   * the per-user index DO (credits + concurrency cap) and the RevenueCat
+   * subscriber — so a Supporter's second device, which adopted the purchasing
+   * device's account id, is recognized as that same RevenueCat customer
+   * instead of being metered as a free user. App Attest key pinning stays on
+   * `uuid`.
+   */
+  meterId: string
   notesText: string
   contentHash: string
   supporter: boolean
@@ -211,6 +232,17 @@ async function authenticateAndGate(
     }
   }
 
+  // Optional shared account id. Reject a malformed one outright rather than
+  // silently falling back to the uuid — a well-behaved client never sends one,
+  // and letting garbage through would put it in a DO name and a signed field.
+  const accountId = body.accountId != null ? asString(body.accountId) : null
+  if (body.accountId != null && (!accountId || !isValidAccountId(accountId))) {
+    return {
+      ok: false,
+      response: err(ctx, HTTP_STATUS.BAD_REQUEST, 'Invalid accountId', 'bad_request'),
+    }
+  }
+
   if (notesText.length > config.maxChars) {
     return {
       ok: false,
@@ -267,6 +299,7 @@ async function authenticateAndGate(
         keyId,
         challenge,
         uuid,
+        accountId: accountId ?? undefined,
         contentHash,
         teamId: ctx.env.APPLE_TEAM_ID,
         bundleId: ctx.env.IOS_BUNDLE_ID,
@@ -287,6 +320,10 @@ async function authenticateAndGate(
   }
 
   // --- Supporter status + credit gate -----------------------------------
+  // Everything below keys on the account id when the client sent one (per-
+  // person Supporter check, credits, caps — ADR 0011), else the install uuid.
+  const meterId = accountId ?? uuid
+
   // Keep the real entitlement distinct from the dev bypass: both are
   // unmetered, but only an actual Supporter should suppress Supporter CTAs.
   let supporter = false
@@ -294,7 +331,7 @@ async function authenticateAndGate(
     try {
       supporter = await isSupporter({
         apiKey: ctx.env.REVENUECAT_API_KEY,
-        appUserId: uuid,
+        appUserId: meterId,
         entitlementId: config.entitlementId,
       })
     } catch (e) {
@@ -309,7 +346,7 @@ async function authenticateAndGate(
   // Pre-flight the credit gate in the per-user index DO (single-threaded →
   // strongly consistent, unlike the old KV read). The commit after a successful
   // run goes through the same DO, so check and charge can't race.
-  const idxId = ctx.env.NOTES_IMPORT_INDEX.idFromName(uuid)
+  const idxId = ctx.env.NOTES_IMPORT_INDEX.idFromName(meterId)
   const decision = await ctx.env.NOTES_IMPORT_INDEX.get(idxId).checkCredit({
     hash: contentHash,
     isSupporter: unmetered,
@@ -339,6 +376,7 @@ async function authenticateAndGate(
     ok: true,
     body,
     uuid,
+    meterId,
     notesText,
     contentHash,
     supporter,
@@ -353,15 +391,18 @@ async function authenticateAndGate(
  * Stable, content-derived import id. Idempotent per (user, content) so a
  * reconnect lands on the same run DO; a refinement is a distinct run because its
  * instruction is part of the identity. `imp_` prefix keeps DO names readable.
+ * Keyed on the meter identity (account id when present) so a person's devices
+ * share replay idempotency, and so an import's slot always lives in the same
+ * index DO that acquired it.
  */
 const deriveImportId = async (
-  uuid: string,
+  meterId: string,
   contentHash: string,
   refinement?: { instruction: string }
 ): Promise<string> => {
   const basis = refinement
-    ? `${uuid}|${contentHash}|r|${refinement.instruction}`
-    : `${uuid}|${contentHash}`
+    ? `${meterId}|${contentHash}|r|${refinement.instruction}`
+    : `${meterId}|${contentHash}`
   return `imp_${(await sha256Hex(basis)).slice(0, 40)}`
 }
 
@@ -377,7 +418,7 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
   const gate = await authenticateAndGate(ctx, config)
   if (!gate.ok) return gate.response
   const {
-    uuid,
+    meterId,
     notesText,
     contentHash,
     supporter,
@@ -387,13 +428,13 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
     isRefinement,
   } = gate
 
-  const importId = await deriveImportId(uuid, contentHash, body.refinement)
+  const importId = await deriveImportId(meterId, contentHash, body.refinement)
 
   // Per-user concurrency cap, enforced race-free in the single-threaded index DO.
   const cap = unmetered
     ? config.activeImportCapSupporter
     : config.activeImportCap
-  const idxId = ctx.env.NOTES_IMPORT_INDEX.idFromName(uuid)
+  const idxId = ctx.env.NOTES_IMPORT_INDEX.idFromName(meterId)
   const acquired = await ctx.env.NOTES_IMPORT_INDEX.get(idxId).acquire(
     importId,
     cap
@@ -412,7 +453,7 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
   try {
     outcome = await ctx.env.NOTES_IMPORT_RUN.get(runId).start({
       importId,
-      uuid,
+      uuid: meterId,
       contentHash,
       notesText,
       context: body.context,
@@ -576,7 +617,7 @@ export async function handleNotesImportRequest(ctx: AppContext) {
   const gate = await authenticateAndGate(ctx, config)
   if (!gate.ok) return gate.response
   const {
-    uuid,
+    meterId,
     notesText,
     contentHash,
     supporter,
@@ -597,9 +638,9 @@ export async function handleNotesImportRequest(ctx: AppContext) {
   // distinct-hash attack takes one slot each and is capped. Synchronous path →
   // a plain try/finally release (no run DO to hand the slot off to).
   const cap = unmetered ? config.activeImportCapSupporter : config.activeImportCap
-  const idxId = ctx.env.NOTES_IMPORT_INDEX.idFromName(uuid)
+  const idxId = ctx.env.NOTES_IMPORT_INDEX.idFromName(meterId)
   const idx = ctx.env.NOTES_IMPORT_INDEX.get(idxId)
-  const slotKey = `legacy:${await deriveImportId(uuid, contentHash, body.refinement)}`
+  const slotKey = `legacy:${await deriveImportId(meterId, contentHash, body.refinement)}`
   const acquired = await idx.acquire(slotKey, cap)
   if (!acquired.ok) {
     return err(

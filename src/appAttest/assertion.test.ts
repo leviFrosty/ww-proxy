@@ -72,6 +72,8 @@ const setup = async () => {
     contentHash: string
     challenge: string
     signCount: number
+    /** Shared account id folded into the signed client data, when present. */
+    accountId?: string
     /** Sign over a DIFFERENT content hash than the one we'll verify against. */
     signContentHash?: string
     /** authData flags byte — real devices set the AT bit (0x40). */
@@ -81,6 +83,7 @@ const setup = async () => {
     const clientData = buildAssertionClientData({
       challenge: opts.challenge,
       uuid: opts.uuid,
+      accountId: opts.accountId,
       contentHash: opts.signContentHash ?? opts.contentHash,
     })
     const clientDataHash = await sha256Bytes(new TextEncoder().encode(clientData))
@@ -99,13 +102,20 @@ const setup = async () => {
     return bytesToBase64Url(cbor)
   }
 
-  const verify = (assertion: string, challenge: string, uuid = 'uuid-1', contentHash = 'hash-1') =>
+  const verify = (
+    assertion: string,
+    challenge: string,
+    uuid = 'uuid-1',
+    contentHash = 'hash-1',
+    accountId?: string
+  ) =>
     verifyAssertion({
       kv: kv as unknown as ChallengeKv,
       assertion,
       keyId: KEY_ID,
       challenge,
       uuid,
+      accountId,
       contentHash,
       teamId: TEAM,
       bundleId: BUNDLE,
@@ -216,6 +226,54 @@ describe('verifyAssertion (end-to-end with a synthetic Secure-Enclave key)', () 
     await expect(
       verify(assertion, challenge, 'uuid-2')
     ).rejects.toThrow(/not bound/)
+  })
+
+  it('accepts an assertion binding a shared account id (four-field clientData)', async () => {
+    const { kv, storeKey, makeAssertion, verify } = await setup()
+    await storeKey('uuid-1')
+    const challenge = await issueChallenge(kv as unknown as ChallengeKv)
+    const assertion = await makeAssertion({
+      uuid: 'uuid-1',
+      contentHash: 'hash-1',
+      challenge,
+      signCount: 1,
+      accountId: 'account-1',
+    })
+    await expect(
+      verify(assertion, challenge, 'uuid-1', 'hash-1', 'account-1')
+    ).resolves.toBeUndefined()
+  })
+
+  it('rejects an assertion whose signed account id differs from the request', async () => {
+    const { kv, storeKey, makeAssertion, verify } = await setup()
+    await storeKey('uuid-1')
+    const challenge = await issueChallenge(kv as unknown as ChallengeKv)
+    const assertion = await makeAssertion({
+      uuid: 'uuid-1',
+      contentHash: 'hash-1',
+      challenge,
+      signCount: 1,
+      accountId: 'account-1',
+    })
+    // A proxying user swapping in someone else's account id post-signature.
+    await expect(
+      verify(assertion, challenge, 'uuid-1', 'hash-1', 'account-2')
+    ).rejects.toThrow('assertion signature invalid')
+  })
+
+  it('rejects an account id the client never signed (old three-field signature)', async () => {
+    const { kv, storeKey, makeAssertion, verify } = await setup()
+    await storeKey('uuid-1')
+    const challenge = await issueChallenge(kv as unknown as ChallengeKv)
+    const assertion = await makeAssertion({
+      uuid: 'uuid-1',
+      contentHash: 'hash-1',
+      challenge,
+      signCount: 1,
+    })
+    await expect(
+      verify(assertion, challenge, 'uuid-1', 'hash-1', 'account-1')
+    ).rejects.toThrow('assertion signature invalid')
   })
 
   it('rejects an unknown device key', async () => {

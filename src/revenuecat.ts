@@ -1,7 +1,9 @@
 /**
- * Server-side Supporter verification via the RevenueCat REST v1 API. The app
- * sets the Keychain UUID as its RevenueCat App User ID (ADR 0007), so we look
- * the subscriber up by that same id and check the configured entitlement.
+ * Server-side Supporter verification via the RevenueCat REST v1 API. The app's
+ * RevenueCat App User ID is its shared account id (witness-work ADR 0011),
+ * which defaults to the Keychain install UUID (ADR 0007) — so we look the
+ * subscriber up by whichever of those the client sent and check the configured
+ * entitlement.
  *
  * The secret key never ships in the app — only the proxy holds it.
  */
