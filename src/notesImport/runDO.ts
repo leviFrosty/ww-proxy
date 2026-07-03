@@ -24,6 +24,12 @@ import type { NotesImportContext } from './schema'
  */
 export interface StartImportInput {
   importId: string
+  /**
+   * The METER identity, not necessarily the device's install uuid: the shared
+   * account id when the client sent one (ADR 0011), else the install uuid.
+   * Only ever used to name the per-user index DO (slot release + credit
+   * commit), so it must match whatever identity the kickoff acquired under.
+   */
   uuid: string
   contentHash: string
   notesText: string

@@ -27,6 +27,13 @@ export interface VerifyAssertionArgs {
   keyId: string
   challenge: string
   uuid: string
+  /**
+   * Shared account id (witness-work ADR 0011), when the client sent one. Not
+   * part of the key pinning — that stays on the per-device `uuid` — but it is
+   * folded into the signed client data so a proxying user can't swap in
+   * someone else's account id post-signature.
+   */
+  accountId?: string
   /** The notes content hash this request is bound to. */
   contentHash: string
   teamId: string
@@ -47,6 +54,7 @@ export const verifyAssertion = async ({
   keyId,
   challenge,
   uuid,
+  accountId,
   contentHash,
   teamId,
   bundleId,
@@ -77,7 +85,12 @@ export const verifyAssertion = async ({
     throw new AppAttestError('assertion sign-count did not increase (replay?)')
   }
 
-  const clientData = buildAssertionClientData({ challenge, uuid, contentHash })
+  const clientData = buildAssertionClientData({
+    challenge,
+    uuid,
+    accountId,
+    contentHash,
+  })
   const clientDataHash = await sha256Bytes(new TextEncoder().encode(clientData))
   const message = concat(asn.authenticatorData, clientDataHash)
 
