@@ -2,9 +2,15 @@ import type { AppContext, ErrorResponse } from '../types'
 import { HTTP_STATUS } from '../config'
 import { Sentry } from '../sentry'
 import { sha256Hex, timingSafeEqual, randomToken } from '../crypto'
-import { getNotesImportConfig, type NotesImportConfig } from './config'
+import {
+  getNotesImportConfig,
+  limitsWindowDurationMs,
+  resolveNotesImportLimits,
+  selectEffectiveAllowances,
+  type NotesImportConfig,
+} from './config'
 import { isSupporter, RevenueCatError } from '../revenuecat'
-import type { CreditDecision } from '../credits'
+import type { CreditDecision, CreditsSnapshot } from '../credits'
 import { runNotesImportModel } from './llm'
 import { getNotesImportStatus } from './status'
 import {
@@ -14,17 +20,26 @@ import {
   AppAttestError,
 } from '../appAttest'
 import { isEmptyImportResult, type NotesImportContext } from './schema'
+import { handleAdminResetRequest, isValidMeterId } from './admin'
+import {
+  buildAllowanceDenial,
+  type NotesImportKickoffResponse,
+} from './contracts'
+import type { NotesImportSuccess } from './events'
+import { resolveTerminalSupporter } from './settlement'
 
 const err = (
   ctx: AppContext,
   status: number,
   error: string,
   code?: string,
-  detail?: string
+  detail?: string,
+  credits?: CreditsSnapshot
 ) => {
   const body: ErrorResponse = { error }
   if (code) body.code = code
   if (detail) body.detail = detail
+  if (credits) body.credits = credits
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return ctx.json(body, status as any)
 }
@@ -55,7 +70,7 @@ const asString = (v: unknown): string | null =>
  * uuid-ish alphabet. Install ids (the value it defaults to on-device) are
  * `Crypto.randomUUID()` strings, which this accepts with room to spare.
  */
-const isValidAccountId = (s: string): boolean => /^[A-Za-z0-9_-]{8,64}$/.test(s)
+const isValidAccountId = isValidMeterId
 
 const subKey = (token: string) => `notes-import:sub:${token}`
 
@@ -68,6 +83,7 @@ export async function handleNotesImportStatusRequest(ctx: AppContext) {
   const config = getNotesImportConfig(ctx.env)
   const status = await getNotesImportStatus({
     kv: ctx.env.NOTES_KV,
+    env: ctx.env,
     apiKey: ctx.env.OPENROUTER_API_KEY,
     config,
   })
@@ -227,8 +243,11 @@ interface GateOk {
   notesText: string
   contentHash: string
   supporter: boolean
-  /** Supporter entitlement or authenticated dev bypass; skips credit charging. */
-  unmetered: boolean
+  /** Existing concurrency behavior: Supporters and dev bypass use the higher cap. */
+  supporterConcurrency: boolean
+  importLimit: number
+  refinementLimit: number
+  windowDurationMs: number
   decision: CreditDecision
   isRefinement: boolean
   /** True when the dev-bypass token was used (gates dev-only error detail). */
@@ -254,11 +273,15 @@ async function authenticateAndGate(
   // run, or calling the API directly never re-checks it. So enforce the same
   // gate here — the single boundary both import paths pass through — before
   // spending an attestation round-trip or any inference. Cheap (KV kill-switch
-  // first, then the cached provider probe) and fail-open by design.
+  // first, then the cached provider probe) and fail-open by design. Internal
+  // enforcement needs availability only; allowance resolution happens once
+  // below after the real entitlement is known.
   const status = await getNotesImportStatus({
     kv: ctx.env.NOTES_KV,
+    env: ctx.env,
     apiKey: ctx.env.OPENROUTER_API_KEY,
     config,
+    includeLimits: false,
   })
   if (!status.available) {
     return {
@@ -392,8 +415,8 @@ async function authenticateAndGate(
   // person Supporter check, credits, caps — ADR 0011), else the install uuid.
   const meterId = accountId ?? uuid
 
-  // Keep the real entitlement distinct from the dev bypass: both are
-  // unmetered, but only an actual Supporter should suppress Supporter CTAs.
+  // Keep real entitlement distinct from dev bypass: bypass overrides allowance
+  // values only, while only an actual Supporter suppresses Supporter CTAs.
   let supporter = false
   if (!devBypass) {
     try {
@@ -408,35 +431,33 @@ async function authenticateAndGate(
       supporter = false
     }
   }
-  const unmetered = supporter || devBypass
+  const supporterConcurrency = supporter || devBypass
+  const limits = await resolveNotesImportLimits(ctx.env, ctx.env.NOTES_KV)
+  const allowances = selectEffectiveAllowances(limits, supporter, devBypass)
+  const windowDurationMs = limitsWindowDurationMs(limits)
 
   const isRefinement = !!body.refinement
   // Pre-flight the credit gate in the per-user index DO (single-threaded →
   // strongly consistent, unlike the old KV read). The commit after a successful
   // run goes through the same DO, so check and charge can't race.
   const idxId = ctx.env.NOTES_IMPORT_INDEX.idFromName(meterId)
-  const decision = await ctx.env.NOTES_IMPORT_INDEX.get(idxId).checkCredit({
+  const checked = await ctx.env.NOTES_IMPORT_INDEX.get(idxId).checkCredit({
     hash: contentHash,
-    isSupporter: unmetered,
+    isSupporter: supporter,
     isRefinement,
-    freeCredits: config.freeCredits,
-    maxRefinements: config.maxRefinements,
+    importLimit: allowances.imports,
+    refinementLimit: allowances.refinements,
+    windowDurationMs,
   })
-  if (!decision.allowed) {
-    const status =
-      decision.reason === 'limit_reached'
-        ? HTTP_STATUS.PAYMENT_REQUIRED
-        : HTTP_STATUS.TOO_MANY_REQUESTS
+  if (!checked.decision.allowed) {
+    const denial = buildAllowanceDenial(
+      checked.decision.reason!,
+      checked.credits
+    )
     return {
       ok: false,
-      response: err(
-        ctx,
-        status,
-        decision.reason === 'limit_reached'
-          ? 'Free import limit reached'
-          : 'Refinement limit reached for this import',
-        decision.reason
-      ),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      response: ctx.json(denial.body, denial.status as any),
     }
   }
 
@@ -448,8 +469,11 @@ async function authenticateAndGate(
     notesText,
     contentHash,
     supporter,
-    unmetered,
-    decision,
+    supporterConcurrency,
+    importLimit: allowances.imports,
+    refinementLimit: allowances.refinements,
+    windowDurationMs,
+    decision: checked.decision,
     isRefinement,
     devBypass,
   }
@@ -490,7 +514,10 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
     notesText,
     contentHash,
     supporter,
-    unmetered,
+    supporterConcurrency,
+    importLimit,
+    refinementLimit,
+    windowDurationMs,
     decision,
     body,
     isRefinement,
@@ -499,7 +526,7 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
   const importId = await deriveImportId(meterId, contentHash, body.refinement)
 
   // Per-user concurrency cap, enforced race-free in the single-threaded index DO.
-  const cap = unmetered
+  const cap = supporterConcurrency
     ? config.activeImportCapSupporter
     : config.activeImportCap
   const idxId = ctx.env.NOTES_IMPORT_INDEX.idFromName(meterId)
@@ -527,7 +554,7 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
       context: body.context,
       refinement: body.refinement,
       isSupporter: supporter,
-      unmetered,
+      devBypass: gate.devBypass,
       decision,
     })
   } catch (e) {
@@ -563,19 +590,24 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
     expirationTtl: config.subscribeTokenTtlSeconds,
   })
 
-  // Usage snapshot up front, so the client's meter populates at run start rather
-  // than only when the `done` event lands. Read-only (no charge) and equal to
-  // the eventual `done` snapshot — see kickoffCredits.
+  // Point-in-time usage preview. It writes nothing and can differ from terminal
+  // state after success, time/config/entitlement changes, or another commit.
   const credits = await ctx.env.NOTES_IMPORT_INDEX.get(idxId).kickoffCredits({
     hash: contentHash,
     decision,
     isSupporter: supporter,
-    unmetered,
-    freeCredits: config.freeCredits,
-    maxRefinements: config.maxRefinements,
+    importLimit,
+    refinementLimit,
+    windowDurationMs,
   })
 
-  return ctx.json({ importId, subscribeToken, refinement: isRefinement, credits })
+  const response = {
+    importId,
+    subscribeToken,
+    refinement: isRefinement,
+    credits,
+  } satisfies NotesImportKickoffResponse
+  return ctx.json(response)
 }
 
 /** Resolve + authorize a stream request to its run DO, or return an error Response. */
@@ -674,6 +706,21 @@ export async function handleNotesImportResultRequest(ctx: AppContext) {
   return ctx.json(snapshot)
 }
 
+/** Secret-protected maintainer reset; registered under the shared rate limiter. */
+export function handleNotesImportAdminResetRequest(ctx: AppContext) {
+  return handleAdminResetRequest(ctx.req.raw, {
+    adminToken: ctx.env.ADMIN_API_TOKEN,
+    indexFor: (meterId) => {
+      const id = ctx.env.NOTES_IMPORT_INDEX.idFromName(meterId)
+      const stub = ctx.env.NOTES_IMPORT_INDEX.get(id)
+      return {
+        objectId: id.toString(),
+        resetUsage: () => stub.resetUsage(),
+      }
+    },
+  })
+}
+
 /**
  * POST /notes-import — LEGACY synchronous path. Held open for the full model run
  * and returns the result in one response. Kept as a fallback during the
@@ -689,7 +736,7 @@ export async function handleNotesImportRequest(ctx: AppContext) {
     notesText,
     contentHash,
     supporter,
-    unmetered,
+    supporterConcurrency,
     decision,
     body,
     isRefinement,
@@ -705,7 +752,9 @@ export async function handleNotesImportRequest(ctx: AppContext) {
   // collapses to one slot (acquire is idempotent for a held id), while the
   // distinct-hash attack takes one slot each and is capped. Synchronous path →
   // a plain try/finally release (no run DO to hand the slot off to).
-  const cap = unmetered ? config.activeImportCapSupporter : config.activeImportCap
+  const cap = supporterConcurrency
+    ? config.activeImportCapSupporter
+    : config.activeImportCap
   const idxId = ctx.env.NOTES_IMPORT_INDEX.idFromName(meterId)
   const idx = ctx.env.NOTES_IMPORT_INDEX.get(idxId)
   const slotKey = `legacy:${await deriveImportId(meterId, contentHash, body.refinement)}`
@@ -741,31 +790,44 @@ export async function handleNotesImportRequest(ctx: AppContext) {
       )
     }
 
-    // Charge only now that the model succeeded — atomic in the index DO. An Empty
-    // Import skips the charge within the rolling window (ADR 0012).
-    const { remaining, refinements, emptyCharged } = await idx.recordUsage({
+    // Resolve terminal policy again: the success snapshot is authoritative and
+    // may differ from kickoff after runtime policy or entitlement changes.
+    const terminalSupporter = await resolveTerminalSupporter({
+      kickoffSupporter: supporter,
+      devBypass: gate.devBypass,
+      apiKey: ctx.env.REVENUECAT_API_KEY,
+      appUserId: meterId,
+      entitlementId: config.entitlementId,
+    })
+    const terminalLimits = await resolveNotesImportLimits(
+      ctx.env,
+      ctx.env.NOTES_KV
+    )
+    const terminalAllowances = selectEffectiveAllowances(
+      terminalLimits,
+      terminalSupporter,
+      gate.devBypass
+    )
+    const { credits, emptyCharged } = await idx.recordUsage({
       hash: contentHash,
-      isSupporter: unmetered,
+      isSupporter: terminalSupporter,
       decision,
-      freeCredits: config.freeCredits,
-      maxRefinements: config.maxRefinements,
+      importLimit: terminalAllowances.imports,
+      refinementLimit: terminalAllowances.refinements,
+      windowDurationMs: limitsWindowDurationMs(terminalLimits),
       isEmpty: isEmptyImportResult(output.result),
       emptyWindowSeconds: config.emptyWindowSeconds,
       emptyWindowLimit: config.emptyWindowLimit,
     })
 
-    return ctx.json({
+    const response = {
       result: output.result,
       contentHash,
       refinement: isRefinement,
       emptyCharged,
-      credits: {
-        remaining,
-        limit: unmetered ? null : config.freeCredits,
-        isSupporter: supporter,
-        refinements,
-      },
-    })
+      credits,
+    } satisfies NotesImportSuccess
+    return ctx.json(response)
   } finally {
     await idx.release(slotKey)
   }

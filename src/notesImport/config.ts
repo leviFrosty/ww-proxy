@@ -1,11 +1,9 @@
 import type { Environment } from '../types'
 
 /**
- * Resolved Notes Import configuration. Every knob is env-overridable so the
- * model/host can be swapped (ADR 0008) and the abuse ceilings tuned without a
- * code change. Defaults are deliberately generous — the goal today is to stop a
- * nefarious actor from racking up the inference bill and to keep a user from
- * blowing past the model's context window, NOT to ration normal use.
+ * Environment-only Notes Import controls (model/provider, abuse ceilings,
+ * active concurrency, Empty Import grace, and retention). Usage allowances are
+ * resolved separately at runtime from KV → env → defaults below.
  */
 /** OpenRouter reasoning effort levels, or null to leave reasoning off. */
 export type ReasoningEffort =
@@ -33,8 +31,6 @@ export interface NotesImportConfig {
   providers: string[]
   maxChars: number
   maxOutputTokens: number
-  freeCredits: number
-  maxRefinements: number
   /**
    * Rolling window (seconds) over which free Empty Imports are counted. An Empty
    * Import (a run that produced no records) doesn't spend a credit, but each still
@@ -93,8 +89,6 @@ const DEFAULTS = {
   providers: ['fireworks', 'digitalocean'],
   maxChars: 100_000,
   maxOutputTokens: 16_000,
-  freeCredits: 5,
-  maxRefinements: 5,
   emptyWindowSeconds: 7 * 24 * 60 * 60,
   emptyWindowLimit: 5,
   entitlementId: 'Supporter',
@@ -106,6 +100,38 @@ const DEFAULTS = {
   // NotesImportConfig.reasoningEffort doc above (and why `max` is NOT used).
   reasoningEffort: 'xhigh' as ReasoningEffort,
 } as const
+
+export interface NotesImportLimits {
+  importsFree: number
+  importsSupporter: number
+  refinementsFree: number
+  refinementsSupporter: number
+  windowDays: number
+}
+
+export interface EffectiveAllowances {
+  imports: number
+  refinements: number
+}
+
+/** Minimal KV interface for the runtime limits document. */
+export interface LimitsKv {
+  get(key: string, options?: { cacheTtl?: number }): Promise<string | null>
+}
+
+const LIMITS_DEFAULTS: NotesImportLimits = {
+  importsFree: 5,
+  importsSupporter: -1,
+  refinementsFree: 5,
+  refinementsSupporter: -1,
+  windowDays: 30,
+}
+
+const LIMITS_KEY = 'notes-import:limits'
+const LIMITS_CACHE_TTL_SECONDS = 60
+const DAY_MS = 24 * 60 * 60 * 1000
+/** Last timestamp whose UTC ISO representation has a client-supported 4-digit year. */
+const MAX_FOUR_DIGIT_UTC_MS = 253_402_300_799_999
 
 const REASONING_EFFORTS = new Set([
   'minimal',
@@ -138,6 +164,55 @@ const intOr = (raw: string | undefined, fallback: number): number => {
   return Number.isFinite(n) && n > 0 ? n : fallback
 }
 
+const validAllowance = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isInteger(value) && value >= -1
+
+const windowDurationMs = (
+  value: unknown,
+  now = Date.now()
+): number | null => {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    return null
+  }
+  const duration = value * DAY_MS
+  if (!Number.isFinite(duration) || duration <= 0) return null
+
+  // JavaScript's ISO formatter supports extended years such as +010240, but the
+  // client contract accepts only 0000-9999. Every active anchor is at or before
+  // now, so bounding the newest possible anchor also bounds every reset emitted
+  // from an older one. Subtraction avoids overflowing `now + duration`.
+  if (
+    !Number.isFinite(now) ||
+    now > MAX_FOUR_DIGIT_UTC_MS ||
+    duration > MAX_FOUR_DIGIT_UTC_MS - now
+  ) {
+    return null
+  }
+  return duration
+}
+
+const validWindowDays = (value: unknown, now = Date.now()): value is number =>
+  windowDurationMs(value, now) != null
+
+const envAllowanceOr = (raw: string | undefined, fallback: number): number => {
+  if (raw == null || raw.trim() === '') return fallback
+  const value = Number(raw)
+  return validAllowance(value) ? value : fallback
+}
+
+const envWindowDaysOr = (
+  raw: string | undefined,
+  fallback: number,
+  now: number
+): number => {
+  if (raw != null && raw.trim() !== '') {
+    const value = Number(raw)
+    if (validWindowDays(value, now)) return value
+  }
+  if (validWindowDays(fallback, now)) return fallback
+  throw new RangeError('Invalid default Notes Import windowDays')
+}
+
 const listOr = (raw: string | undefined, fallback: readonly string[]): string[] => {
   if (!raw) return [...fallback]
   const items = raw
@@ -147,6 +222,103 @@ const listOr = (raw: string | undefined, fallback: readonly string[]): string[] 
   return items.length ? items : [...fallback]
 }
 
+/**
+ * Resolve allowance policy independently per field: KV, then environment, then
+ * code default. KV is edge-cached for 60 seconds. Bad runtime configuration is
+ * observable but never blocks Notes Import.
+ */
+export const resolveNotesImportLimits = async (
+  env: Environment,
+  kv: LimitsKv
+): Promise<NotesImportLimits> => {
+  const now = Date.now()
+  let document: Record<string, unknown> = {}
+  try {
+    const raw = await kv.get(LIMITS_KEY, {
+      cacheTtl: LIMITS_CACHE_TTL_SECONDS,
+    })
+    if (raw != null) {
+      const parsed: unknown = JSON.parse(raw)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        document = parsed as Record<string, unknown>
+      } else {
+        console.warn('notes-import limits KV document must be a JSON object')
+      }
+    }
+  } catch (error) {
+    console.warn('notes-import limits KV read/parse failed', error)
+  }
+
+  const envLimits: NotesImportLimits = {
+    importsFree: envAllowanceOr(
+      env.NOTES_IMPORT_FREE_CREDITS,
+      LIMITS_DEFAULTS.importsFree
+    ),
+    importsSupporter: envAllowanceOr(
+      env.NOTES_IMPORT_FREE_CREDITS_SUPPORTER,
+      LIMITS_DEFAULTS.importsSupporter
+    ),
+    refinementsFree: envAllowanceOr(
+      env.NOTES_IMPORT_MAX_REFINEMENTS,
+      LIMITS_DEFAULTS.refinementsFree
+    ),
+    refinementsSupporter: envAllowanceOr(
+      env.NOTES_IMPORT_MAX_REFINEMENTS_SUPPORTER,
+      LIMITS_DEFAULTS.refinementsSupporter
+    ),
+    windowDays: envWindowDaysOr(
+      env.NOTES_IMPORT_WINDOW_DAYS,
+      LIMITS_DEFAULTS.windowDays,
+      now
+    ),
+  }
+
+  const allowanceField = (
+    key: keyof Omit<NotesImportLimits, 'windowDays'>
+  ): number => {
+    if (!(key in document)) return envLimits[key]
+    const value = document[key]
+    if (validAllowance(value)) return value
+    console.warn(`notes-import limits KV field ${key} is invalid`)
+    return envLimits[key]
+  }
+
+  let windowDays = envLimits.windowDays
+  if ('windowDays' in document) {
+    if (validWindowDays(document.windowDays, now)) windowDays = document.windowDays
+    else console.warn('notes-import limits KV field windowDays is invalid')
+  }
+
+  return {
+    importsFree: allowanceField('importsFree'),
+    importsSupporter: allowanceField('importsSupporter'),
+    refinementsFree: allowanceField('refinementsFree'),
+    refinementsSupporter: allowanceField('refinementsSupporter'),
+    windowDays,
+  }
+}
+
+/** Select tier policy; dev bypass changes allowances only, never entitlement. */
+export const selectEffectiveAllowances = (
+  limits: NotesImportLimits,
+  isSupporter: boolean,
+  devBypass: boolean
+): EffectiveAllowances => {
+  if (devBypass) return { imports: -1, refinements: -1 }
+  return isSupporter
+    ? {
+        imports: limits.importsSupporter,
+        refinements: limits.refinementsSupporter,
+      }
+    : { imports: limits.importsFree, refinements: limits.refinementsFree }
+}
+
+export const limitsWindowDurationMs = (limits: NotesImportLimits): number => {
+  const duration = windowDurationMs(limits.windowDays)
+  if (duration == null) throw new RangeError('Invalid Notes Import windowDays')
+  return duration
+}
+
 export const getNotesImportConfig = (env: Environment): NotesImportConfig => ({
   model: env.NOTES_IMPORT_MODEL?.trim() || DEFAULTS.model,
   providers: listOr(env.NOTES_IMPORT_PROVIDERS, DEFAULTS.providers),
@@ -154,11 +326,6 @@ export const getNotesImportConfig = (env: Environment): NotesImportConfig => ({
   maxOutputTokens: intOr(
     env.NOTES_IMPORT_MAX_OUTPUT_TOKENS,
     DEFAULTS.maxOutputTokens
-  ),
-  freeCredits: intOr(env.NOTES_IMPORT_FREE_CREDITS, DEFAULTS.freeCredits),
-  maxRefinements: intOr(
-    env.NOTES_IMPORT_MAX_REFINEMENTS,
-    DEFAULTS.maxRefinements
   ),
   emptyWindowSeconds: intOr(
     env.NOTES_IMPORT_EMPTY_WINDOW_SECONDS,

@@ -45,7 +45,9 @@ wrangler kv namespace create NOTES_KV --env dev
 wrangler secret put OPENROUTER_API_KEY --env dev
 wrangler secret put REVENUECAT_API_KEY --env dev
 wrangler secret put NOTES_IMPORT_DEV_BYPASS_TOKEN --env dev   # dev only
+wrangler secret put ADMIN_API_TOKEN --env dev  # unique dev reset token
 # Plus any other secrets prod uses that dev needs (HERE_API_KEY, SENTRY_DSN, ...).
+# Production uses a different token: wrangler secret put ADMIN_API_TOKEN
 
 # 3. Deploy.
 wrangler deploy --env dev
@@ -66,6 +68,32 @@ wrangler dev --remote --env dev   # Cloudflare edge with dev bindings
 
 Neither gives a stable public URL for an iOS device — use the deployed
 `--env dev` worker (or a `cloudflared` tunnel) for real-device App Attest tests.
+
+## Notes Import runtime limits and admin reset
+
+Allowance policy lives in each environment's `NOTES_KV` under
+`notes-import:limits` and is edge-cached for 60 seconds. Its JSON shape is:
+
+```json
+{"importsFree":5,"importsSupporter":-1,"refinementsFree":5,"refinementsSupporter":-1,"windowDays":30}
+```
+
+Each field independently resolves KV → the matching `wrangler.toml` env var →
+code default. Allowances accept integer `-1` (unlimited), `0` (none), or a
+positive value; `windowDays` accepts any positive finite number, including
+fractions for short dev windows.
+
+To reset one meter's rolling aggregate and Empty Import rows while preserving
+permanent replay/refinement records, copy `.env.example` to the gitignored
+`.env`, set the environment-specific token/URL, then run:
+
+```bash
+pnpm run admin:reset-usage <meterId>         # production
+pnpm run admin:reset-usage --dev <meterId>   # development
+```
+
+`ADMIN_API_TOKEN` and `ADMIN_API_TOKEN_DEV` must match separate Wrangler
+`ADMIN_API_TOKEN` secrets in prod/dev. Never reuse the development bypass token.
 
 ## Checks before deploy
 

@@ -26,12 +26,17 @@ export const sha256Bytes = async (data: Uint8Array): Promise<Uint8Array> => {
 export const sha256Hex = async (text: string): Promise<string> =>
   toHex(await sha256Bytes(encoder.encode(text)))
 
-/** Constant-time string compare (avoids timing oracles on secret tokens). */
+/**
+ * Fixed-work string comparison for bounded secret tokens. Folding the lengths
+ * into the result and always scanning the same 256 UTF-16 positions avoids the
+ * early length/content exits that create a useful token timing oracle.
+ */
 export const timingSafeEqual = (a: string, b: string): boolean => {
-  if (a.length !== b.length) return false
-  let diff = 0
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
-  return diff === 0
+  let diff = a.length ^ b.length
+  for (let i = 0; i < 256; i++) {
+    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0)
+  }
+  return diff === 0 && a.length <= 256 && b.length <= 256
 }
 
 /** Decodes standard or URL-safe base64 to bytes. */

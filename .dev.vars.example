@@ -26,3 +26,14 @@ REVENUECAT_API_KEY=sk_your_revenuecat_secret_here
 # Local dev only: lets the iOS simulator (no Secure Enclave) skip App Attest by
 # sending header `x-ww-dev-bypass: <this value>`. Leave UNSET in production.
 NOTES_IMPORT_DEV_BYPASS_TOKEN=local-dev-bypass
+
+# Dedicated local admin-reset token. Do not reuse the dev-bypass token.
+ADMIN_API_TOKEN=generate_with_openssl_rand_base64_32
+
+# Optional local fallbacks for the runtime `notes-import:limits` KV document.
+# Allowances: -1 unlimited, 0 none, positive integer finite. Days may be fractional.
+NOTES_IMPORT_FREE_CREDITS=5
+NOTES_IMPORT_FREE_CREDITS_SUPPORTER=-1
+NOTES_IMPORT_MAX_REFINEMENTS=5
+NOTES_IMPORT_MAX_REFINEMENTS_SUPPORTER=-1
+NOTES_IMPORT_WINDOW_DAYS=30

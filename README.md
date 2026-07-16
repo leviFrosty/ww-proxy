@@ -173,41 +173,71 @@ records. The proxy owns the prompt + JSON schema, calls the model through
 OpenRouter with routing pinned ZDR-only (`zdr: true` + `data_collection: 'deny'`,
 restricted to a vetted Western provider allowlist) so the request can only reach
 a zero-data-retention host that never trains on or stores it — failing rather
-than ever downgrading to a data-retaining provider (ADR 0008). It meters free
-usage and persists **only** counters and device keys in KV — never notes text or
-model output.
+than ever downgrading to a data-retaining provider (ADR 0008). It persists
+non-content authentication/runtime metadata in KV and aggregate usage plus
+permanent replay/refinement records in a per-user Durable Object—never imported
+text or model output in either meter store.
 
-Three routes (all rate-limited, all `POST`):
+Core routes (all rate-limited):
 
-- **`/notes-import/challenge`** → `{ challenge }`. One-time App Attest nonce.
-- **`/notes-import/attest`** `{ keyId, attestation, challenge, uuid }` → `{ ok }`.
-  The App Attest handshake; verifies the attestation and stores the device's
-  public key pinned to the Keychain `uuid` (ADR 0007).
-- **`/notes-import`** `{ uuid, notesText, contentHash, context, keyId, challenge,
-  assertion, refinement? }` → `{ result, contentHash, refinement, credits }`,
-  where `credits` includes the import and per-source refinement allowances.
-  Verifies the per-request App Attest assertion (the security boundary), checks
-  Supporter status via RevenueCat + the free-credit cap, then runs the model.
+- **`POST /notes-import/challenge`** → `{ challenge }`. One-time App Attest nonce.
+- **`POST /notes-import/attest`** performs the App Attest handshake.
+- **`POST /notes-import/kickoff`** starts a streaming run and returns its handle,
+  capability token, and strict `credits` preview; `GET .../events` / `.../result`
+  carry the terminal result and authoritative `credits` snapshot.
+- **`POST /notes-import`** is the synchronous fallback under identical rules.
+- **`GET /notes-import/status`** is public and supplies a fresh allowance
+  schedule only when availability is confirmed.
 
-Auth is enforced by Apple **App Attest** on every call. A dev/staging worker may
-set `NOTES_IMPORT_DEV_BYPASS_TOKEN` so the iOS simulator can send
-`x-ww-dev-bypass: <token>` to skip attestation and import-credit metering during
-development. The per-source refinement safety cap still applies. **Never set
-this token in production.**
+Auth is enforced by Apple **App Attest** on every inference kickoff. A dev worker
+may set `NOTES_IMPORT_DEV_BYPASS_TOKEN` so the simulator can send
+`x-ww-dev-bypass: <token>` to skip attestation. It overrides both effective usage
+allowances to unlimited while keeping real Supporter status false and retaining
+hash/refinement accounting. Existing active-concurrency behavior is unchanged.
+**Never set this token in production.**
 
 **One-time setup** (beyond HERE/Sentry):
 
 ```bash
-# KV namespace for challenges, device keys, and usage counters
 pnpm exec wrangler kv namespace create NOTES_KV
 # → paste the printed id into wrangler.toml [[kv_namespaces]] id
 
-pnpm exec wrangler secret put OPENROUTER_API_KEY   # OpenRouter key (routed ZDR-only)
-pnpm exec wrangler secret put REVENUECAT_API_KEY   # RevenueCat REST v1 secret (sk_...)
+pnpm exec wrangler secret put OPENROUTER_API_KEY
+pnpm exec wrangler secret put REVENUECAT_API_KEY
+pnpm exec wrangler secret put ADMIN_API_TOKEN
+pnpm exec wrangler secret put ADMIN_API_TOKEN --env dev  # use a DIFFERENT value
 ```
 
-All Notes Import limits (model, provider allowlist, char ceiling, free credits,
-refinement cap) are env-overridable — see `src/notesImport/config.ts`.
+#### Runtime allowance configuration
+
+Each environment's `NOTES_KV` may contain `notes-import:limits`:
+
+```json
+{"importsFree":5,"importsSupporter":-1,"refinementsFree":5,"refinementsSupporter":-1,"windowDays":30}
+```
+
+Allowance values are integer `-1` (unlimited), `0` (none), or positive finite;
+`windowDays` is any positive finite number and may be fractional in development.
+Each field independently resolves KV → environment variable → code default. KV
+reads use a 60-second edge cache. Model/provider, concurrency, and Empty Import
+grace controls remain environment-only; see `src/notesImport/config.ts` and
+`wrangler.toml`.
+
+#### Admin usage reset
+
+Generate distinct prod/dev tokens with `openssl rand -base64 32`, configure the
+Wrangler secrets above, copy `.env.example` to the gitignored `.env`, and set the
+matching local tokens plus the dev Worker URL. Then run:
+
+```bash
+pnpm run admin:reset-usage <meterId>         # production
+pnpm run admin:reset-usage --dev <meterId>   # development
+```
+
+The secret route clears only the aggregate import window and Empty Import rows;
+permanent hash replay and refinement records survive. Missing configuration or
+bad auth returns 404. Data Studio remains the manual emergency fallback. Never
+reuse `NOTES_IMPORT_DEV_BYPASS_TOKEN` as the admin secret.
 
 ### `/health`
 

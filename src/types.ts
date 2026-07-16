@@ -83,11 +83,20 @@ export interface Environment {
   /** `maxOutputTokens` ceiling for the model call. Default 16000. */
   NOTES_IMPORT_MAX_OUTPUT_TOKENS?: string;
 
-  /** Free distinct-content imports per non-Supporter identity. Default 5. */
+  /** Free-tier imports per fixed window. -1 unlimited, 0 none, default 5. */
   NOTES_IMPORT_FREE_CREDITS?: string;
 
-  /** Max stateless follow-up refinements per content hash. Default 5. */
+  /** Supporter imports per fixed window. -1 unlimited, 0 none, default -1. */
+  NOTES_IMPORT_FREE_CREDITS_SUPPORTER?: string;
+
+  /** Free-tier lifetime refinements per content hash. Default 5. */
   NOTES_IMPORT_MAX_REFINEMENTS?: string;
+
+  /** Supporter lifetime refinements per content hash. Default -1. */
+  NOTES_IMPORT_MAX_REFINEMENTS_SUPPORTER?: string;
+
+  /** Fixed import-window duration in days; positive fractions allowed. Default 30. */
+  NOTES_IMPORT_WINDOW_DAYS?: string;
 
   /** Rolling window (seconds) for counting free Empty Imports. Default 604800 (7d). */
   NOTES_IMPORT_EMPTY_WINDOW_SECONDS?: string;
@@ -123,6 +132,9 @@ export interface Environment {
    * simulator (no Secure Enclave) can exercise the flow. Unset in production.
    */
   NOTES_IMPORT_DEV_BYPASS_TOKEN?: string;
+
+  /** Dedicated admin reset credential. Secret; distinct per prod/dev worker. */
+  ADMIN_API_TOKEN?: string;
 }
 
 export type AppContext = Context<{ Bindings: Environment }>;
@@ -149,4 +161,6 @@ export interface ErrorResponse {
    * is visible on-device. Never populated for attested production requests.
    */
   detail?: string;
+  /** Required authoritative state on structured usage denials. */
+  credits?: import('./credits').CreditsSnapshot;
 }

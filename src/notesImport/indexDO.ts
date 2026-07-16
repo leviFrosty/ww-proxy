@@ -2,18 +2,24 @@ import { DurableObject } from 'cloudflare:workers'
 import type { Environment } from '../types'
 import { decideAcquire } from './cap'
 import {
-  decideCredit,
+  allowanceDeniedEvent,
+  emitNotesImportOperationalEvent,
+  windowRolledOverEvent,
+} from './operations'
+import {
   computeCommit,
+  computeCreditsSnapshot,
   computeKickoffCredits,
-  refinementUsage,
+  decideCredit,
+  normalizeImportWindow,
+  type Allowance,
   type CreditDecision,
   type CreditState,
   type CreditsSnapshot,
   type HashRecord,
-  type RefinementUsage,
+  type ImportWindow,
 } from '../credits'
 
-/** One active-import row tracked for a user. */
 export interface ActiveImport {
   importId: string
   status: string
@@ -22,68 +28,62 @@ export interface ActiveImport {
 
 export interface AcquireResult {
   ok: boolean
-  /** Active count AFTER this call (so the client can render "N of cap"). */
   active: number
 }
 
-/** Pre-flight credit check (read-only). */
 export interface CheckCreditArgs {
   hash: string
   isSupporter: boolean
   isRefinement: boolean
-  freeCredits: number
-  maxRefinements: number
+  importLimit: Allowance
+  refinementLimit: Allowance
+  windowDurationMs: number
 }
 
-/** Post-success credit commit. */
+export interface CheckCreditResult {
+  decision: CreditDecision
+  /** Current authoritative state; denials return this same strict snapshot. */
+  credits: CreditsSnapshot
+}
+
 export interface RecordUsageArgs {
   hash: string
+  /** Real entitlement only; allowance values independently drive metering. */
   isSupporter: boolean
   decision: CreditDecision
-  freeCredits: number
-  maxRefinements: number
-  /** The model produced no records (an Empty Import) — skip the charge (ADR 0012). */
+  importLimit: Allowance
+  refinementLimit: Allowance
+  windowDurationMs: number
   isEmpty: boolean
-  /** Rolling window (seconds) over which free Empty Imports are counted. */
   emptyWindowSeconds: number
-  /** Free Empty Imports allowed per window before they charge again. */
   emptyWindowLimit: number
 }
 
-/** What a commit returns for the client's usage meter. */
 export interface RecordUsageResult {
-  remaining: number | null
-  refinements: RefinementUsage
-  /** An empty run charged a credit anyway (window exhausted) — drives the Scribe notice. */
+  credits: CreditsSnapshot
   emptyCharged: boolean
 }
 
-/** Read-only kickoff snapshot inputs (mirrors {@link RecordUsageArgs} but no write). */
 export interface KickoffCreditsArgs {
   hash: string
   decision: CreditDecision
   isSupporter: boolean
-  unmetered: boolean
-  freeCredits: number
-  maxRefinements: number
+  importLimit: Allowance
+  refinementLimit: Allowance
+  windowDurationMs: number
+}
+
+export interface ResetUsageResult {
+  previousCount: number
+  hadActiveWindow: boolean
+  deletedEmptyRuns: number
 }
 
 /**
- * `NotesImportIndex` — one instance per user (keyed by their install uuid). It
- * is the authority for two per-user invariants:
- *
- *  1. "how many imports may run at once" — the kickoff/legacy paths call
- *     {@link acquire} before running the model and {@link release} when it
- *     settles (also backs the app's "active imports" list/badge); and
- *  2. the FREE-CREDIT METER — {@link checkCredit} (pre-flight) / {@link recordUsage}
- *     (post-success commit) / {@link kickoffCredits} (read-only snapshot).
- *
- * Both live here because this DO is a SINGLE instance per user and
- * single-threaded, so its SQLite storage is strongly consistent and its RPC
- * calls are serialized — the credit read-modify-write is therefore ATOMIC (it
- * previously raced over eventually-consistent KV, letting concurrent imports all
- * read the same stale count and bypass the cap). Holds NO notes content — only
- * import ids, coarse status, and usage counters (ADR 0008).
+ * One Durable Object per meter identity. It serializes both active-import slots
+ * and allowance state. SQLite contains no notes/model output: only opaque run
+ * handles, aggregate usage, permanent content-hash records, and Empty Import
+ * timestamps.
  */
 export class NotesImportIndex extends DurableObject<Environment> {
   constructor(ctx: DurableObjectState, env: Environment) {
@@ -95,7 +95,6 @@ export class NotesImportIndex extends DurableObject<Environment> {
          startedAt INTEGER NOT NULL
        )`
     )
-    // Per-user credit meter (was KV `credits:<uuid>` / `hash:<uuid>:<hash>`).
     ctx.storage.sql.exec(
       `CREATE TABLE IF NOT EXISTS credit_meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL)`
     )
@@ -106,20 +105,16 @@ export class NotesImportIndex extends DurableObject<Environment> {
          refinements INTEGER NOT NULL
        )`
     )
-    // Rolling-window log of free Empty Imports (ADR 0012). One row per empty run
-    // that consumed a free allowance; pruned to the window on every write so it
-    // never accumulates. Only its COUNT within the window is read.
     ctx.storage.sql.exec(
       `CREATE TABLE IF NOT EXISTS empty_run (ts INTEGER NOT NULL)`
     )
   }
 
-  // --- Concurrency cap ----------------------------------------------------
+  // --- Active concurrency (unchanged) -----------------------------------
 
-  /** Reserve a slot for importId when under cap. Idempotent for a held id. */
   acquire(importId: string, cap: number): AcquireResult {
     const held = this.#has(importId)
-    const active = this.#count()
+    const active = this.#activeCount()
     if (!decideAcquire(active, held, cap)) return { ok: false, active }
     if (!held) {
       this.ctx.storage.sql.exec(
@@ -132,15 +127,11 @@ export class NotesImportIndex extends DurableObject<Environment> {
     return { ok: true, active: held ? active : active + 1 }
   }
 
-  /** Drop a slot once its run has settled. Safe to call for an unknown id. */
   release(importId: string): void {
     this.ctx.storage.sql.exec('DELETE FROM active WHERE importId = ?', importId)
   }
 
-  /** The user's currently-active imports, newest first. */
   list(): ActiveImport[] {
-    // Inline row literal (not the named interface) so it satisfies the SqlStorage
-    // `Record<string, SqlStorageValue>` constraint; shape matches ActiveImport.
     return this.ctx.storage.sql
       .exec<{ importId: string; status: string; startedAt: number }>(
         'SELECT importId, status, startedAt FROM active ORDER BY startedAt DESC'
@@ -148,73 +139,145 @@ export class NotesImportIndex extends DurableObject<Environment> {
       .toArray()
   }
 
-  // --- Credit meter (atomic: single-threaded DO) --------------------------
+  // --- Allowances --------------------------------------------------------
 
-  /**
-   * Pre-flight gate for the model call — read-only, no charge. Returns the same
-   * {@link CreditDecision} shape the route/run DO freeze and later commit.
-   */
-  checkCredit(args: CheckCreditArgs): CreditDecision {
-    return decideCredit({
-      state: this.#creditState(args.hash),
-      isSupporter: args.isSupporter,
+  checkCredit(args: CheckCreditArgs): CheckCreditResult {
+    const now = Date.now()
+    const state = this.#creditState(args.hash)
+    const decision = decideCredit({
+      state,
       isRefinement: args.isRefinement,
-      freeCredits: args.freeCredits,
-      maxRefinements: args.maxRefinements,
+      importLimit: args.importLimit,
+      refinementLimit: args.refinementLimit,
+      now,
+      windowDurationMs: args.windowDurationMs,
     })
+    const credits = computeCreditsSnapshot({
+      state,
+      isSupporter: args.isSupporter,
+      importLimit: args.importLimit,
+      refinementLimit: args.refinementLimit,
+      now,
+      windowDurationMs: args.windowDurationMs,
+    })
+
+    if (!decision.allowed) {
+      const normalized = normalizeImportWindow(
+        state.window,
+        now,
+        args.windowDurationMs
+      )
+      emitNotesImportOperationalEvent(
+        allowanceDeniedEvent({
+          objectId: this.ctx.id.toString(),
+          kind:
+            decision.reason === 'refinement_limit' ? 'refinement' : 'import',
+          isSupporter: args.isSupporter,
+          used:
+            decision.reason === 'refinement_limit'
+              ? state.record?.refinements ?? 0
+              : normalized.count,
+          limit:
+            decision.reason === 'refinement_limit'
+              ? args.refinementLimit
+              : args.importLimit,
+          resetsAt:
+            decision.reason === 'limit_reached' ? credits.resetsAt : null,
+        })
+      )
+    }
+
+    return { decision, credits }
   }
 
-  /**
-   * Commit usage after a successful model run. Reads the CURRENT state and writes
-   * the next state in one serialized turn — no interleave, no lost increment.
-   * Idempotent per hash (a `charged` hash isn't re-charged). Returns the credits
-   * remaining plus the post-commit refinement allowance for the response body.
-   */
   recordUsage(args: RecordUsageArgs): RecordUsageResult {
     const now = Date.now()
-    const windowStart = now - args.emptyWindowSeconds * 1000
+    const emptyWindowStart = now - args.emptyWindowSeconds * 1000
     const state = this.#creditState(args.hash)
     const commit = computeCommit({
       decision: args.decision,
       state,
-      isSupporter: args.isSupporter,
-      freeCredits: args.freeCredits,
+      importLimit: args.importLimit,
+      now,
+      windowDurationMs: args.windowDurationMs,
       empty: {
         isEmpty: args.isEmpty,
-        countInWindow: this.#countEmptyRuns(windowStart),
+        countInWindow: this.#countEmptyRuns(emptyWindowStart),
         limit: args.emptyWindowLimit,
       },
     })
+
+    // Snapshot formatting can reject an unrepresentable reset timestamp. Do it
+    // before any SQL mutation so bad runtime input cannot leave a charged hash
+    // or window behind when no success response can be produced.
+    const credits = computeCreditsSnapshot({
+      state: commit.state,
+      isSupporter: args.isSupporter,
+      importLimit: args.importLimit,
+      refinementLimit: args.refinementLimit,
+      now,
+      windowDurationMs: args.windowDurationMs,
+    })
+
     if (commit.recordsEmptyRun) {
       this.#recordEmptyRun(now)
-      this.#pruneEmptyRuns(windowStart)
+      this.#pruneEmptyRuns(emptyWindowStart)
     }
-    if (commit.state.count !== state.count) this.#setCount(commit.state.count)
+    if (
+      commit.state.window.count !== state.window.count ||
+      commit.state.window.startedAt !== state.window.startedAt
+    ) {
+      this.#setWindow(commit.state.window)
+    }
     if (commit.state.record) this.#writeRecord(args.hash, commit.state.record)
-    return {
-      remaining: commit.remaining,
-      refinements: refinementUsage(commit.state.record, args.maxRefinements),
-      emptyCharged: commit.emptyCharged,
+
+    if (commit.rollover) {
+      emitNotesImportOperationalEvent(
+        windowRolledOverEvent({
+          objectId: this.ctx.id.toString(),
+          isSupporter: args.isSupporter,
+          previousUsed: commit.rollover.previousCount,
+          previousLimit: args.importLimit,
+          previousResetsAt: commit.rollover.previousResetsAt,
+          newResetsAt: commit.rollover.newResetsAt,
+        })
+      )
     }
+
+    return { credits, emptyCharged: commit.emptyCharged }
   }
 
-  /**
-   * Read-only usage snapshot for the kickoff response, so the client's meter
-   * populates at run start. Equal to the eventual `done` snapshot (the pending
-   * refinement is folded in) — see {@link computeKickoffCredits}.
-   */
   kickoffCredits(args: KickoffCreditsArgs): CreditsSnapshot {
+    const now = Date.now()
     return computeKickoffCredits({
       decision: args.decision,
-      record: this.#record(args.hash),
+      state: this.#creditState(args.hash),
       isSupporter: args.isSupporter,
-      unmetered: args.unmetered,
-      freeCredits: args.freeCredits,
-      maxRefinements: args.maxRefinements,
+      importLimit: args.importLimit,
+      refinementLimit: args.refinementLimit,
+      now,
+      windowDurationMs: args.windowDurationMs,
     })
   }
 
-  // --- storage helpers ----------------------------------------------------
+  /**
+   * Clear only rolling usage and Empty Import grace. Permanent hash/refinement
+   * records deliberately survive so old notes remain free to replay and retain
+   * their lifetime refinement accounting.
+   */
+  resetUsage(): ResetUsageResult {
+    const window = this.#creditWindow()
+    const deletedEmptyRuns = this.#allEmptyRunCount()
+    this.ctx.storage.sql.exec('DELETE FROM credit_meta')
+    this.ctx.storage.sql.exec('DELETE FROM empty_run')
+    return {
+      previousCount: window.count,
+      hadActiveWindow: window.startedAt != null,
+      deletedEmptyRuns,
+    }
+  }
+
+  // --- Storage helpers ---------------------------------------------------
 
   #has(importId: string): boolean {
     return (
@@ -227,27 +290,42 @@ export class NotesImportIndex extends DurableObject<Environment> {
     )
   }
 
-  #count(): number {
+  #activeCount(): number {
     return this.ctx.storage.sql
       .exec<{ n: number }>('SELECT COUNT(*) AS n FROM active')
       .one().n
   }
 
   #creditState(hash: string): CreditState {
-    return { count: this.#creditCount(), record: this.#record(hash) }
+    return { window: this.#creditWindow(), record: this.#record(hash) }
   }
 
-  #creditCount(): number {
+  #creditWindow(): ImportWindow {
     const rows = this.ctx.storage.sql
-      .exec<{ v: number }>("SELECT v FROM credit_meta WHERE k = 'count'")
+      .exec<{ k: string; v: number }>(
+        "SELECT k, v FROM credit_meta WHERE k IN ('count', 'windowStartedAt')"
+      )
       .toArray()
-    return rows.length ? rows[0].v : 0
+    const values = new Map(rows.map((row) => [row.k, row.v]))
+    const startedAt = values.get('windowStartedAt') ?? null
+    // A count without an anchor is abandoned pre-window development data.
+    return {
+      count: startedAt == null ? 0 : values.get('count') ?? 0,
+      startedAt,
+    }
   }
 
-  #setCount(count: number): void {
+  #setWindow(window: ImportWindow): void {
+    if (window.startedAt == null) {
+      this.ctx.storage.sql.exec(
+        "DELETE FROM credit_meta WHERE k IN ('count', 'windowStartedAt')"
+      )
+      return
+    }
     this.ctx.storage.sql.exec(
-      "INSERT OR REPLACE INTO credit_meta (k, v) VALUES ('count', ?)",
-      count
+      "INSERT OR REPLACE INTO credit_meta (k, v) VALUES ('count', ?), ('windowStartedAt', ?)",
+      window.count,
+      window.startedAt
     )
   }
 
@@ -271,10 +349,15 @@ export class NotesImportIndex extends DurableObject<Environment> {
     )
   }
 
-  /** Empty runs logged within the rolling window (`ts` strictly after `since`). */
   #countEmptyRuns(since: number): number {
     return this.ctx.storage.sql
       .exec<{ n: number }>('SELECT COUNT(*) AS n FROM empty_run WHERE ts > ?', since)
+      .one().n
+  }
+
+  #allEmptyRunCount(): number {
+    return this.ctx.storage.sql
+      .exec<{ n: number }>('SELECT COUNT(*) AS n FROM empty_run')
       .one().n
   }
 
@@ -282,7 +365,6 @@ export class NotesImportIndex extends DurableObject<Environment> {
     this.ctx.storage.sql.exec('INSERT INTO empty_run (ts) VALUES (?)', ts)
   }
 
-  /** Drop rows that have aged out of the window (`ts` at or before `before`). */
   #pruneEmptyRuns(before: number): void {
     this.ctx.storage.sql.exec('DELETE FROM empty_run WHERE ts <= ?', before)
   }

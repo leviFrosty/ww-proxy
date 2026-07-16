@@ -20,6 +20,7 @@ import {
   handleNotesImportResultRequest,
   handleNotesImportCancelRequest,
   handleNotesImportDestroyRequest,
+  handleNotesImportAdminResetRequest,
 } from "./notesImport/route";
 import { Sentry, createSentryConfig } from "./sentry";
 
@@ -77,6 +78,7 @@ app.use("/geocode", rateLimitMiddleware);
 app.use("/autocomplete", rateLimitMiddleware);
 app.use("/notes-import", rateLimitMiddleware);
 app.use("/notes-import/*", rateLimitMiddleware);
+app.use("/admin/*", rateLimitMiddleware);
 
 app.get("/geocode", handleGeocodeRequest);
 app.get("/autocomplete", handleAutocompleteRequest);
@@ -95,6 +97,8 @@ app.post("/notes-import/:importId/cancel", handleNotesImportCancelRequest);
 app.post("/notes-import/:importId/destroy", handleNotesImportDestroyRequest);
 // Legacy synchronous path (fallback during cutover).
 app.post("/notes-import", handleNotesImportRequest);
+// Maintainer-only usage reset (secret auth inside handler; 404 fail-closed).
+app.post("/admin/notes-import/reset", handleNotesImportAdminResetRequest);
 // Universal-link support for WitnessWork contact sharing. AASA must be served
 // at this exact path with Content-Type application/json and no redirects.
 app.get("/.well-known/apple-app-site-association", handleAasaRequest);

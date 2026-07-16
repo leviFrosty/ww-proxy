@@ -1,6 +1,11 @@
 import { DurableObject } from 'cloudflare:workers'
 import type { Environment } from '../types'
-import { getNotesImportConfig } from './config'
+import {
+  getNotesImportConfig,
+  limitsWindowDurationMs,
+  resolveNotesImportLimits,
+  selectEffectiveAllowances,
+} from './config'
 import { decideStartOutcome, type StartOutcome } from './cap'
 import { runNotesImportModel, type ModelProgress } from './llm'
 import type { CreditDecision } from '../credits'
@@ -15,12 +20,13 @@ import {
   type UnsequencedEvent,
 } from './events'
 import { isEmptyImportResult, type NotesImportContext } from './schema'
+import { resolveTerminalSupporter } from './settlement'
 
 /**
  * Everything the kickoff handler hands the run DO. All fields are
  * structured-clone-safe (passed over DO RPC). Auth, the ZDR routing decision,
- * supporter status and the credit `decision` are all resolved on the attested
- * kickoff request and frozen here — the run never re-derives them.
+ * and the credit `decision` are frozen at attested kickoff. Kickoff supporter
+ * status is retained as the fallback for a terminal entitlement refresh.
  */
 export interface StartImportInput {
   importId: string
@@ -35,9 +41,10 @@ export interface StartImportInput {
   notesText: string
   context: NotesImportContext
   refinement?: { previousResultJSON: string; instruction: string }
+  /** Real entitlement as observed at kickoff; terminal success re-resolves it. */
   isSupporter: boolean
-  /** True for either a Supporter or an authenticated dev-bypass request. */
-  unmetered?: boolean
+  /** Authenticated development bypass; overrides usage allowances only. */
+  devBypass: boolean
   decision: CreditDecision
 }
 
@@ -89,6 +96,12 @@ export class NotesImportRun extends DurableObject<Environment> {
    * `cancelled` status.
    */
   #aborter: AbortController | null = null
+  /**
+   * Non-null from the final cancellation check through usage commit and the
+   * terminal `done` write. A concurrent cancel waits for this promise instead
+   * of interleaving with settlement and overwriting/charging `cancelled`.
+   */
+  #settlement: Promise<void> | null = null
 
   constructor(ctx: DurableObjectState, env: Environment) {
     super(ctx, env)
@@ -157,15 +170,24 @@ export class NotesImportRun extends DurableObject<Environment> {
 
   /**
    * Interrupt a still-running import. Aborts the in-flight model call so it stops
-   * spending provider tokens, then records a terminal `cancelled` state. Because
-   * `recordUsage` is only ever reached AFTER the model resolves, a cancel before
-   * completion never charges a credit (mirrors the failure path). Frees the
+   * spending provider tokens, then records a terminal `cancelled` state. A cancel
+   * that wins the final pre-settlement check never charges; once serialized
+   * settlement starts, cancel waits for its terminal result. Frees the
    * user's concurrency slot immediately so a resend isn't blocked by the cap, and
    * emits a terminal `cancelled` event so any attached subscriber closes. No-op
    * once the run is already terminal. Authorized upstream by the kickoff's
    * subscribe-token capability (same as the stream/result reads).
    */
   async cancel(): Promise<RunResultSnapshot> {
+    // Settlement has already won its final cancellation check. Wait for its
+    // terminal write so this call returns `done` (or `error`) rather than
+    // interleaving a `cancelled` write while recordUsage is in flight.
+    const settlement = this.#settlement
+    if (settlement) {
+      await settlement
+      return this.getResult()
+    }
+
     const status = this.#status()
     if (
       status === null ||
@@ -193,6 +215,14 @@ export class NotesImportRun extends DurableObject<Environment> {
    * subscribe-token capability (same as the stream/result/cancel reads).
    */
   async destroy(): Promise<void> {
+    // Use the same winner-takes-all boundary as cancel(). Before #settlement is
+    // published, abort wins and its callback (including recordUsage) can never
+    // start. Once published, settlement owns the credit + terminal write; wait
+    // for it to finish, then honor destroy's stronger forget-all-state contract.
+    // This prevents a deferred callback from recreating state after deleteAll.
+    const settlement = this.#settlement
+    if (settlement) await settlement
+
     // Stop any running model call. A still-live run holds its input (with the
     // uuid) — read it BEFORE deleteAll so the slot can be released; a terminal
     // run already released on its way out and has dropped the input.
@@ -260,8 +290,9 @@ export class NotesImportRun extends DurableObject<Environment> {
     this.#setStatus('starting')
     const config = getNotesImportConfig(this.env)
     const startedAt = Date.now()
+    const objectId = this.ctx.id.toString()
     console.log(
-      `notes-import[${input.importId}] run starting (refinement=${!!input.refinement})`
+      `notes-import[${objectId}] run starting (refinement=${!!input.refinement})`
     )
 
     // Fresh controller per run so a client `cancel()` can abort the model call.
@@ -282,43 +313,60 @@ export class NotesImportRun extends DurableObject<Environment> {
       // path: a failure never costs the user a credit). Commit atomically in the
       // per-user index DO — the same single-threaded DO that gated the kickoff —
       // so check-then-charge can't race and increments are never lost.
-      const idxId = this.env.NOTES_IMPORT_INDEX.idFromName(input.uuid)
-      const { remaining, refinements, emptyCharged } = await this.env
-        .NOTES_IMPORT_INDEX.get(idxId)
-        .recordUsage({
+      // Re-resolve entitlement and runtime policy at settlement. Kickoff is a
+      // preview; this post-commit snapshot is authoritative if either changed.
+      const terminalSupporter = await resolveTerminalSupporter({
+        kickoffSupporter: input.isSupporter,
+        devBypass: input.devBypass,
+        apiKey: this.env.REVENUECAT_API_KEY,
+        appUserId: input.uuid,
+        entitlementId: config.entitlementId,
+      })
+      const limits = await resolveNotesImportLimits(this.env, this.env.NOTES_KV)
+      const allowances = selectEffectiveAllowances(
+        limits,
+        terminalSupporter,
+        input.devBypass
+      )
+      const payload = await this.#settle(async () => {
+        const idxId = this.env.NOTES_IMPORT_INDEX.idFromName(input.uuid)
+        const { credits, emptyCharged } = await this.env.NOTES_IMPORT_INDEX.get(
+          idxId
+        ).recordUsage({
           hash: input.contentHash,
-          isSupporter: input.unmetered ?? input.isSupporter,
+          isSupporter: terminalSupporter,
           decision: input.decision,
-          freeCredits: config.freeCredits,
-          maxRefinements: config.maxRefinements,
+          importLimit: allowances.imports,
+          refinementLimit: allowances.refinements,
+          windowDurationMs: limitsWindowDurationMs(limits),
           isEmpty: isEmptyImportResult(out.result),
           emptyWindowSeconds: config.emptyWindowSeconds,
           emptyWindowLimit: config.emptyWindowLimit,
         })
 
-      const payload: NotesImportSuccess = {
-        result: out.result,
-        contentHash: input.contentHash,
-        refinement: !!input.refinement,
-        emptyCharged,
-        credits: {
-          remaining,
-          limit:
-            (input.unmetered ?? input.isSupporter) ? null : config.freeCredits,
-          isSupporter: input.isSupporter,
-          refinements,
-        },
+        const settledPayload: NotesImportSuccess = {
+          result: out.result,
+          contentHash: input.contentHash,
+          refinement: !!input.refinement,
+          emptyCharged,
+          credits,
+        }
+        this.#metaSet('result', JSON.stringify(settledPayload))
+        this.#setStatus('done')
+        // Drop the raw notes the instant the run is terminal: only `result` is
+        // needed for the reconnect window, the client already holds the source
+        // text, and a refinement re-sends it — so notesText is dead weight that
+        // would otherwise rest in storage for the full retention hour.
+        this.#metaDel('input')
+        this.#emit({ type: 'done', payload: settledPayload })
+        return settledPayload
+      })
+      if (!payload) {
+        console.log(`notes-import[${objectId}] run cancelled before settlement`)
+        return
       }
-      this.#metaSet('result', JSON.stringify(payload))
-      this.#setStatus('done')
-      // Drop the raw notes the instant the run is terminal: only `result` is
-      // needed for the reconnect window, the client already holds the source
-      // text, and a refinement re-sends it — so notesText is dead weight that
-      // would otherwise rest in storage for the full retention hour.
-      this.#metaDel('input')
-      this.#emit({ type: 'done', payload })
       console.log(
-        `notes-import[${input.importId}] run done in ${
+        `notes-import[${objectId}] run done in ${
           Date.now() - startedAt
         }ms (provider=${out.resolvedProvider ?? 'unknown'} reasoningTokens=${
           out.usage.reasoningTokens ?? 0
@@ -329,7 +377,7 @@ export class NotesImportRun extends DurableObject<Environment> {
       // never charge a credit or overwrite the 'cancelled' terminal state that
       // cancel() already wrote. Anything else is a genuine model error.
       if (this.#aborter?.signal.aborted) {
-        console.log(`notes-import[${input.importId}] run cancelled`)
+        console.log(`notes-import[${objectId}] run cancelled`)
       } else {
         console.error('notes-import run model_error', errorDetail(e))
         await this.#fail(
@@ -344,6 +392,30 @@ export class NotesImportRun extends DurableObject<Environment> {
       // overwrites.)
       await this.#releaseSlot(input.uuid, input.importId)
       await this.#scheduleCleanup()
+    }
+  }
+
+  /**
+   * Atomically choose settlement over cancellation. There is no await between
+   * the final cancelled-state check and publishing #settlement, so cancel() can
+   * either win before this point (no callback/charge) or wait until the complete
+   * usage + terminal-state transaction has won.
+   */
+  async #settle<T>(callback: () => Promise<T>): Promise<T | null> {
+    if (this.#status() === 'cancelled' || this.#aborter?.signal.aborted) {
+      return null
+    }
+
+    let finish!: () => void
+    const settlement = new Promise<void>((resolve) => {
+      finish = resolve
+    })
+    this.#settlement = settlement
+    try {
+      return await callback()
+    } finally {
+      this.#settlement = null
+      finish()
     }
   }
 

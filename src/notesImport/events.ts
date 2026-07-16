@@ -14,6 +14,7 @@
  * replays an event it already applied.
  */
 
+import type { CreditsSnapshot } from '../credits'
 import type { NotesImportResult } from './schema'
 
 /** Coarse lifecycle, surfaced purely so the wait feels alive. */
@@ -43,12 +44,7 @@ export interface NotesImportSuccess {
    * treat as false.
    */
   emptyCharged: boolean
-  credits: {
-    remaining: number | null
-    limit: number | null
-    isSupporter: boolean
-    refinements: { remaining: number; limit: number }
-  }
+  credits: CreditsSnapshot
 }
 
 /** Terminal failure, branchable by the same codes the legacy path returns. */

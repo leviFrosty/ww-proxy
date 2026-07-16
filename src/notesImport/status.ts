@@ -1,4 +1,9 @@
-import type { NotesImportConfig } from './config'
+import {
+  resolveNotesImportLimits,
+  type NotesImportConfig,
+  type NotesImportLimits,
+} from './config'
+import type { Environment } from '../types'
 
 /** The KV subset this module uses — keeps it trivially mockable in tests. */
 export type StatusKv = Pick<KVNamespace, 'get' | 'put'>
@@ -33,11 +38,20 @@ export type StatusKv = Pick<KVNamespace, 'get' | 'put'>
 /** Machine reasons the worker emits; operators may set free-form text instead. */
 export type NotesImportUnavailableReason = 'disabled' | 'no_provider'
 
-export interface NotesImportStatusResponse {
-  available: boolean
-  /** A known reason, or operator-supplied text from the kill-switch record. */
-  reason?: string
+export interface PublicNotesImportLimits {
+  imports: { free: number | null; supporter: number | null }
+  refinements: { free: number | null; supporter: number | null }
+  windowDays: number
 }
+
+/**
+ * Available responses normally carry the fresh public schedule. A fail-open
+ * provider-probe error deliberately omits it so clients can attempt an import
+ * without presenting allowance claims that the probe did not confirm.
+ */
+export type NotesImportStatusResponse =
+  | { available: true; limits?: PublicNotesImportLimits }
+  | { available: false; reason?: string }
 
 const ENABLED_KEY = 'notes-import:enabled'
 const PROVIDER_CACHE_KEY = 'notes-import:provider-health'
@@ -159,8 +173,11 @@ const parseEnabledOverride = (raw: string | null): EnabledOverride | null => {
 
 export interface NotesImportStatusDeps {
   kv: StatusKv
+  env: Environment
   apiKey: string
   config: NotesImportConfig
+  /** Internal enforcement probes skip schedule resolution to avoid a second KV read. */
+  includeLimits?: boolean
   /** Injectable for tests; defaults to the global `fetch`. */
   fetchFn?: typeof fetch
 }
@@ -169,34 +186,77 @@ export interface NotesImportStatusDeps {
  * Resolves whether Notes Import is currently usable. Cheap KV kill-switch first,
  * then a cached provider-health probe. Never throws — fails open.
  */
+const publicSchedule = (limits: NotesImportLimits): PublicNotesImportLimits => {
+  const wire = (value: number): number | null => (value === -1 ? null : value)
+  return {
+    imports: {
+      free: wire(limits.importsFree),
+      supporter: wire(limits.importsSupporter),
+    },
+    refinements: {
+      free: wire(limits.refinementsFree),
+      supporter: wire(limits.refinementsSupporter),
+    },
+    windowDays: limits.windowDays,
+  }
+}
+
 export const getNotesImportStatus = async ({
   kv,
+  env,
   apiKey,
   config,
+  includeLimits = true,
   fetchFn = fetch,
 }: NotesImportStatusDeps): Promise<NotesImportStatusResponse> => {
-  // 1. Manual kill-switch. Only an explicit `available: false` short-circuits;
-  // `available: true` falls through to the provider check below.
-  const override = parseEnabledOverride(await kv.get(ENABLED_KEY))
+  const availableWithSchedule = async (): Promise<NotesImportStatusResponse> =>
+    includeLimits
+      ? {
+          available: true,
+          limits: publicSchedule(await resolveNotesImportLimits(env, kv)),
+        }
+      : { available: true }
+  // 1. Manual kill-switch. Read and decide this stage independently: once an
+  // explicit OFF value has been observed, a later provider-cache failure must
+  // never turn the feature back on.
+  let overrideRaw: string | null
+  try {
+    overrideRaw = await kv.get(ENABLED_KEY)
+  } catch {
+    return { available: true }
+  }
+  const override = parseEnabledOverride(overrideRaw)
   if (override && !override.available) {
     return { available: false, reason: override.reason ?? 'disabled' }
   }
 
-  // 2. Provider health (cached).
-  const cached = await kv.get(PROVIDER_CACHE_KEY)
-  if (cached === 'up') return { available: true }
+  // 2. Provider health cache. Its read may fail open, but cannot bypass the
+  // already-decided kill-switch stage above.
+  let cached: string | null
+  try {
+    cached = await kv.get(PROVIDER_CACHE_KEY)
+  } catch {
+    return { available: true }
+  }
+  if (cached === 'up') return availableWithSchedule()
   if (cached === 'down') return { available: false, reason: 'no_provider' }
 
+  // 3. Probe. Only probe failures fail open. Persisting the confirmed result is
+  // best effort and must not reverse an unhealthy result when KV.put fails.
+  let healthy: boolean
   try {
-    const healthy = await probeProviderHealth(apiKey, config, fetchFn)
+    healthy = await probeProviderHealth(apiKey, config, fetchFn)
+  } catch {
+    return { available: true }
+  }
+  try {
     await kv.put(PROVIDER_CACHE_KEY, healthy ? 'up' : 'down', {
       expirationTtl: PROVIDER_CACHE_TTL_SECONDS,
     })
-    return healthy
-      ? { available: true }
-      : { available: false, reason: 'no_provider' }
   } catch {
-    // Fail open — don't cache a transient failure.
-    return { available: true }
+    // The current probe result is still authoritative for this response.
   }
+  return healthy
+    ? availableWithSchedule()
+    : { available: false, reason: 'no_provider' }
 }

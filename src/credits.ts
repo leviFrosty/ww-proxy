@@ -1,35 +1,28 @@
 /**
- * Import-credit metering — PURE decision + arithmetic, no storage. The
- * authoritative counters live in the per-user `NotesImportIndex` Durable Object
- * (see `notesImport/indexDO.ts`), which is ONE single-threaded instance per
- * install uuid: its SQLite storage is strongly consistent and its RPC calls are
- * serialized, so the check-and-commit that used to race over eventually-
- * consistent KV is now atomic. This module holds only the pure math the DO wraps
- * (mirrors how `cap.ts` extracts `decideAcquire` out of the index DO), so it
- * unit-tests without importing the `cloudflare:workers` runtime.
- *
- * Metering unit is 1 credit per distinct content hash. Replays of a known hash
- * and stateless follow-up refinements are free (the latter capped). Supporters
- * are unlimited but their hashes are still recorded so the refinement cap and
- * replay-recognition work uniformly. Credit is charged AFTER a successful model
- * run (a failure/cancel must never cost a credit); the residual overage from a
- * concurrent burst is bounded by the per-user concurrency cap — see
- * {@link computeCommit}.
- *
- * The old KV keys `credits:<uuid>` and `hash:<uuid>:<hash>` are ABANDONED; the
- * counters moved into the index DO (ADR 0008, decision 7 — the "counters" the
- * KV note refers to now live in the DO).
+ * Pure Notes Import allowance decisions. Storage and clocks belong to the
+ * per-user NotesImportIndex Durable Object; every time/window/config input is
+ * explicit here so the full gate -> successful commit -> snapshot sequence is
+ * deterministic and testable.
  */
 
-/** A per-content-hash usage record. */
+/** Internal allowance sentinel: -1 unlimited, 0 none, positive finite. */
+export type Allowance = number
+
+/** A per-content-hash usage record, retained permanently across import windows. */
 export interface HashRecord {
   charged: boolean
   refinements: number
 }
 
-/** The per-user credit state a decision/commit reads. `record` null = new hash. */
-export interface CreditState {
+/** Aggregate usage for one anchored fixed import window. */
+export interface ImportWindow {
   count: number
+  startedAt: number | null
+}
+
+/** The per-user state read by a decision/commit. `record: null` means new hash. */
+export interface CreditState {
+  window: ImportWindow
   record: HashRecord | null
 }
 
@@ -38,75 +31,109 @@ export type CreditDenyReason = 'limit_reached' | 'refinement_limit'
 export interface CreditDecision {
   allowed: boolean
   reason?: CreditDenyReason
-  /** True when this content hash has not been charged/recorded before. */
+  /** True when this content hash had no permanent record at preflight. */
   isNewHash: boolean
   isRefinement: boolean
-  /** Credits left after this import would commit; `null` for Supporters. */
+  /** Projected import balance after this run succeeds; null means unlimited. */
   remaining: number | null
 }
 
 export interface RefinementUsage {
-  remaining: number
-  limit: number
+  remaining: number | null
+  limit: number | null
 }
 
-/** The usage snapshot the client renders in its meter (kickoff + `done`). */
+/** Strict usage contract shared by kickoff, done, legacy success, and denials. */
 export interface CreditsSnapshot {
   remaining: number | null
   limit: number | null
+  resetsAt: string | null
+  /** Real RevenueCat entitlement only; it never implies an allowance value. */
   isSupporter: boolean
   refinements: RefinementUsage
 }
 
-const clampRemaining = (count: number, freeCredits: number): number =>
-  Math.max(0, freeCredits - count)
+/**
+ * Treat an absent or expired anchor as an inactive empty window. Expiry is
+ * inclusive: at exactly `startedAt + duration`, the old window is inactive.
+ * This function does not persist; the next successful finite charge lazily
+ * replaces an expired stored window.
+ */
+export const normalizeImportWindow = (
+  window: ImportWindow,
+  now: number,
+  windowDurationMs: number
+): ImportWindow =>
+  window.startedAt == null || now >= window.startedAt + windowDurationMs
+    ? { count: 0, startedAt: null }
+    : window
+
+const finiteRemaining = (count: number, limit: number): number =>
+  Math.max(0, limit - count)
+
+const importRemaining = (window: ImportWindow, limit: Allowance): number | null =>
+  limit === -1 ? null : finiteRemaining(window.count, limit)
+
+const wireLimit = (limit: Allowance): number | null =>
+  limit === -1 ? null : limit
 
 export interface DecideCreditArgs {
   state: CreditState
-  isSupporter: boolean
   isRefinement: boolean
-  freeCredits: number
-  maxRefinements: number
+  importLimit: Allowance
+  refinementLimit: Allowance
+  now: number
+  windowDurationMs: number
 }
 
 /**
- * Pre-flight gate (no writes). Decides whether this import may call the model.
- * Persist the outcome with {@link computeCommit} only after a successful call so
- * a model failure never costs the user a credit.
+ * Read-only preflight. Known hashes replay without import allowance; refinements
+ * use only their per-hash lifetime allowance. New finite imports are admitted
+ * from the normalized fixed window and charged only by computeCommit on success.
  */
 export const decideCredit = ({
   state,
-  isSupporter,
   isRefinement,
-  freeCredits,
-  maxRefinements,
+  importLimit,
+  refinementLimit,
+  now,
+  windowDurationMs,
 }: DecideCreditArgs): CreditDecision => {
-  const { count, record } = state
+  const window = normalizeImportWindow(state.window, now, windowDurationMs)
+  const { record } = state
 
   if (record) {
-    // Known hash → replay or refinement, always free of a new credit.
-    if (isRefinement && record.refinements + 1 > maxRefinements) {
+    if (
+      isRefinement &&
+      refinementLimit !== -1 &&
+      record.refinements >= refinementLimit
+    ) {
       return {
         allowed: false,
         reason: 'refinement_limit',
         isNewHash: false,
         isRefinement: true,
-        remaining: isSupporter ? null : clampRemaining(count, freeCredits),
+        remaining: importRemaining(window, importLimit),
       }
     }
     return {
       allowed: true,
       isNewHash: false,
       isRefinement,
-      remaining: isSupporter ? null : clampRemaining(count, freeCredits),
+      remaining: importRemaining(window, importLimit),
     }
   }
 
-  // Brand-new content. Refinement flag is irrelevant without a prior record.
-  if (isSupporter) {
-    return { allowed: true, isNewHash: true, isRefinement: false, remaining: null }
+  // A refinement flag has no meaning without a prior hash record.
+  if (importLimit === -1) {
+    return {
+      allowed: true,
+      isNewHash: true,
+      isRefinement: false,
+      remaining: null,
+    }
   }
-  if (count >= freeCredits) {
+  if (window.count >= importLimit) {
     return {
       allowed: false,
       reason: 'limit_reached',
@@ -119,217 +146,230 @@ export const decideCredit = ({
     allowed: true,
     isNewHash: true,
     isRefinement: false,
-    remaining: freeCredits - count - 1,
+    remaining: finiteRemaining(window.count + 1, importLimit),
   }
 }
 
-/** Reads the authoritative per-source refinement allowance from a record. */
+/** Current per-hash lifetime refinement usage in strict wire form. */
 export const refinementUsage = (
   record: HashRecord | null,
-  maxRefinements: number
+  refinementLimit: Allowance
 ): RefinementUsage => {
-  const used = Math.min(maxRefinements, record?.refinements ?? 0)
-  return { remaining: maxRefinements - used, limit: maxRefinements }
+  if (refinementLimit === -1) return { remaining: null, limit: null }
+  return {
+    remaining: finiteRemaining(record?.refinements ?? 0, refinementLimit),
+    limit: refinementLimit,
+  }
 }
 
-export interface KickoffCreditsArgs {
-  decision: CreditDecision
-  /** Current record for the hash (pre-commit); drives the refinement allowance. */
-  record: HashRecord | null
-  /** The real Supporter entitlement (drives the snapshot's `isSupporter`). */
+export interface CreditsSnapshotArgs {
+  state: CreditState
   isSupporter: boolean
-  /** Supporter OR dev bypass — both suppress the import limit (`limit: null`). */
-  unmetered: boolean
-  freeCredits: number
-  maxRefinements: number
+  importLimit: Allowance
+  refinementLimit: Allowance
+  now: number
+  windowDurationMs: number
+}
+
+/** Build the authoritative current snapshot from persisted state. */
+export const computeCreditsSnapshot = ({
+  state,
+  isSupporter,
+  importLimit,
+  refinementLimit,
+  now,
+  windowDurationMs,
+}: CreditsSnapshotArgs): CreditsSnapshot => {
+  const window = normalizeImportWindow(state.window, now, windowDurationMs)
+  const resetsAt =
+    importLimit > 0 && window.startedAt != null
+      ? new Date(window.startedAt + windowDurationMs).toISOString()
+      : null
+  return {
+    remaining: importRemaining(window, importLimit),
+    limit: wireLimit(importLimit),
+    resetsAt,
+    isSupporter,
+    refinements: refinementUsage(state.record, refinementLimit),
+  }
+}
+
+export interface KickoffCreditsArgs extends CreditsSnapshotArgs {
+  decision: CreditDecision
 }
 
 /**
- * Builds the usage snapshot to return at KICKOFF — before the model runs — so
- * the client shows the meter the moment a run starts instead of waiting for the
- * `done` event. Writes nothing: `decision.remaining` is the read-only
- * post-settlement credit count the gate already computed, so it equals what
- * `done` reports. A refinement is charged only on success, so fold this pending
- * one in here too — otherwise the meter would tick down by one when `done`
- * lands. (For a new hash or a free replay, `decision.isRefinement` is false and
- * the refinement count is unchanged.)
+ * Kickoff preview. It projects the admitted run's finite decrement for immediate
+ * display, but cannot invent an anchor: a first window still has resetsAt null
+ * until terminal success commits it. Terminal state may also differ because a
+ * concurrent run, expiry, entitlement, or runtime-config change intervened.
  */
 export const computeKickoffCredits = ({
   decision,
-  record,
+  state,
   isSupporter,
-  unmetered,
-  freeCredits,
-  maxRefinements,
+  importLimit,
+  refinementLimit,
+  now,
+  windowDurationMs,
 }: KickoffCreditsArgs): CreditsSnapshot => {
-  const usage = refinementUsage(record, maxRefinements)
-  const refinements = decision.isRefinement
-    ? { ...usage, remaining: Math.max(0, usage.remaining - 1) }
-    : usage
-  return {
-    remaining: decision.remaining,
-    limit: unmetered ? null : freeCredits,
+  const current = computeCreditsSnapshot({
+    state,
     isSupporter,
+    importLimit,
+    refinementLimit,
+    now,
+    windowDurationMs,
+  })
+  const refinements = decision.isRefinement
+    ? refinementLimit === -1
+      ? current.refinements
+      : {
+          remaining: Math.max(0, (current.refinements.remaining ?? 0) - 1),
+          limit: current.refinements.limit,
+        }
+    : current.refinements
+  return {
+    ...current,
+    remaining: decision.remaining,
     refinements,
   }
 }
 
-/**
- * Empty-import anti-abuse grace (see {@link computeCommit}). An Empty Import — a
- * successful run that produced ZERO records — should not spend an Import Credit,
- * so a User's credits are never wasted on a paste that yields nothing. But each
- * empty run still costs a real (paid) model call, so the grace is bounded: past
- * a rolling-window limit of empty runs, they charge again (soft degrade).
- */
+/** Separate rolling Empty Import grace, unchanged by the import window. */
 export interface EmptyGrace {
-  /** The model produced no records (mirrors the client's `isEmptyPreview`). */
   isEmpty: boolean
-  /** Empty runs already logged in the rolling window, BEFORE this one. */
   countInWindow: number
-  /** Free empty runs allowed per window before the soft degrade. */
   limit: number
 }
 
 export interface CommitCreditArgs {
   decision: CreditDecision
+  /** Current serialized state, re-read immediately before settlement. */
   state: CreditState
-  isSupporter: boolean
-  freeCredits: number
-  /**
-   * Empty-import grace. Absent (or `isEmpty: false`) models a normal run that
-   * charges per the usual rules — so existing non-empty callers pass nothing.
-   */
+  /** Effective allowance at settlement, which may differ from kickoff. */
+  importLimit: Allowance
+  now: number
+  windowDurationMs: number
   empty?: EmptyGrace
 }
 
+export interface WindowRollover {
+  previousCount: number
+  previousResetsAt: string
+  newResetsAt: string
+}
+
 export interface CommitCreditResult {
-  /** The next state to persist. */
   state: CreditState
-  /** Credits remaining after the commit (`null` for Supporters). */
-  remaining: number | null
-  /**
-   * The run produced no records but STILL charged a credit because the rolling
-   * empty-run window was already exhausted (soft degrade). Drives the client's
-   * "this empty one counted" Scribe notice. False for a normal charge and for a
-   * within-window free empty.
-   */
   emptyCharged: boolean
-  /**
-   * This run consumed one of the free empty-run allowances, so the caller must
-   * append its timestamp to the window log. Only true for an Empty Import that
-   * would otherwise have charged (never for supporters/refinements/replays).
-   */
   recordsEmptyRun: boolean
+  /** Present only when a successful finite charge replaces an expired window. */
+  rollover: WindowRollover | null
 }
 
 /**
- * Computes the post-success commit from the CURRENT state (read atomically by
- * the index DO immediately before this call). Charge-after-success is race-free
- * because both the read and the write happen inside the single-threaded DO, so
- * concurrent commits are serialized — no lost increment (the old KV read-modify-
- * write dropped writes; this cannot). The one residual is bounded overage: up to
- * `cap` new-hash imports can pass the pre-flight gate while `count` sits just
- * under `freeCredits`, then each commit atomically increments, so a user may end
- * up at most `cap - 1` over the free limit. That's intentional — reserve-then-
- * refund's failure mode (silently losing a user's credits on a missed refund) is
- * worse than a tiny bounded overage — and the concurrency cap on BOTH import
- * paths keeps it small.
- *
- * Idempotent per hash: a new-hash charge only increments when the hash isn't
- * already `charged`, so a re-kick/replay of an already-charged hash never
- * double-charges (the `charged` flag is the idempotency key).
+ * Settle a successful run against current state. The per-user DO serializes this
+ * read/commit/write, preserving the existing bounded concurrent-overage policy:
+ * every previously admitted distinct hash may commit, and wire balances clamp
+ * to zero. A hash record makes each source permanently replayable.
  */
 export const computeCommit = ({
   decision,
   state,
-  isSupporter,
-  freeCredits,
+  importLimit,
+  now,
+  windowDurationMs,
   empty,
 }: CommitCreditArgs): CommitCreditResult => {
-  const { count, record } = state
+  const { record } = state
+  const finiteCharge =
+    decision.isNewHash && importLimit > 0 && record == null
 
-  // Empty-import anti-abuse grace. It only matters when a credit would OTHERWISE
-  // be charged — a brand-new, non-supporter, not-yet-charged hash. Supporters,
-  // refinements and replays never charge, so an empty result there saves nothing
-  // and needs no window bookkeeping.
-  const wouldCharge = decision.isNewHash && !isSupporter && !record?.charged
-  if (empty?.isEmpty && wouldCharge) {
-    if (empty.countInWindow < empty.limit) {
-      // Within the window → the empty run is free. Charge nothing and DON'T
-      // record the hash (so a later re-paste of corrected text flows through as a
-      // fresh, chargeable import); only log the run against the rolling window.
-      return {
-        state,
-        remaining: clampRemaining(count, freeCredits),
-        emptyCharged: false,
-        recordsEmptyRun: true,
-      }
-    }
-    // Window exhausted → soft degrade: charge exactly as a normal new hash would,
-    // but flag it so the client tells the user, and still log the run.
-    const nextCount = count + 1
+  if (empty?.isEmpty && finiteCharge && empty.countInWindow < empty.limit) {
+    // Free Empty Import: no hash record and no aggregate-window mutation.
     return {
-      state: {
-        count: nextCount,
-        record: { charged: true, refinements: record?.refinements ?? 0 },
-      },
-      remaining: clampRemaining(nextCount, freeCredits),
-      emptyCharged: true,
+      state,
+      emptyCharged: false,
       recordsEmptyRun: true,
+      rollover: null,
     }
   }
 
   if (decision.isNewHash) {
-    if (isSupporter) {
-      // Record the hash (for the refinement cap + replay recognition) but never
-      // charge. Keep any existing record so this is idempotent.
-      return {
-        state: { count, record: record ?? { charged: false, refinements: 0 } },
-        remaining: null,
-        emptyCharged: false,
-        recordsEmptyRun: false,
-      }
-    }
-    // Idempotency guard: charge a given hash at most once. If it's already
-    // charged (a re-commit / replay), leave the count untouched.
-    if (record?.charged) {
+    // Another serialized commit may already have recorded this hash.
+    if (record) {
       return {
         state,
-        remaining: clampRemaining(count, freeCredits),
         emptyCharged: false,
         recordsEmptyRun: false,
+        rollover: null,
       }
     }
-    const nextCount = count + 1
+
+    if (importLimit > 0) {
+      const normalized = normalizeImportWindow(
+        state.window,
+        now,
+        windowDurationMs
+      )
+      const startsWindow = normalized.startedAt == null
+      const nextWindow: ImportWindow = startsWindow
+        ? { count: 1, startedAt: now }
+        : { count: normalized.count + 1, startedAt: normalized.startedAt }
+      const wasExpired =
+        state.window.startedAt != null &&
+        now >= state.window.startedAt + windowDurationMs
+      const rollover = wasExpired
+        ? {
+            previousCount: state.window.count,
+            previousResetsAt: new Date(
+              state.window.startedAt! + windowDurationMs
+            ).toISOString(),
+            newResetsAt: new Date(now + windowDurationMs).toISOString(),
+          }
+        : null
+      return {
+        state: {
+          window: nextWindow,
+          record: { charged: true, refinements: 0 },
+        },
+        emptyCharged: empty?.isEmpty ?? false,
+        recordsEmptyRun: empty?.isEmpty ?? false,
+        rollover,
+      }
+    }
+
+    // Unlimited (or a limit changed to zero after admission): retain replay and
+    // refinement accounting, but consume/anchor no import-window usage.
     return {
       state: {
-        count: nextCount,
-        record: { charged: true, refinements: record?.refinements ?? 0 },
+        window: state.window,
+        record: { charged: false, refinements: 0 },
       },
-      remaining: clampRemaining(nextCount, freeCredits),
       emptyCharged: false,
       recordsEmptyRun: false,
+      rollover: null,
     }
   }
 
   if (decision.isRefinement) {
-    const base = record ?? { charged: !isSupporter, refinements: 0 }
+    const base = record ?? { charged: false, refinements: 0 }
     return {
       state: {
-        count,
-        record: { charged: base.charged, refinements: base.refinements + 1 },
+        window: state.window,
+        record: { ...base, refinements: base.refinements + 1 },
       },
-      remaining: isSupporter ? null : clampRemaining(count, freeCredits),
       emptyCharged: false,
       recordsEmptyRun: false,
+      rollover: null,
     }
   }
 
-  // Free replay of a known hash — no state change.
   return {
     state,
-    remaining: isSupporter ? null : clampRemaining(count, freeCredits),
     emptyCharged: false,
     recordsEmptyRun: false,
+    rollover: null,
   }
 }

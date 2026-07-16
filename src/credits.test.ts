@@ -1,468 +1,410 @@
 import { describe, expect, it } from 'vitest'
 import {
-  decideCredit,
   computeCommit,
+  computeCreditsSnapshot,
   computeKickoffCredits,
+  decideCredit,
+  normalizeImportWindow,
   refinementUsage,
+  type Allowance,
   type CreditDecision,
   type CreditState,
   type HashRecord,
+  type ImportWindow,
 } from './credits'
 
-const FREE = 5
-const MAXREF = 5
+const DAY_MS = 24 * 60 * 60 * 1000
+const WINDOW_MS = 30 * DAY_MS
+const JULY_1 = Date.UTC(2026, 6, 1)
+const DEFAULT_IMPORTS = 5
+const DEFAULT_REFINEMENTS = 5
 
-/**
- * A tiny in-memory stand-in for the index DO's per-user credit storage, so the
- * pure functions can be exercised through the same read → decide → commit → write
- * sequence the DO performs. The DO is single-threaded, so applying commits
- * serially (each reading fresh state) is exactly what production does.
- */
 class MeterStore {
-  count = 0
+  window: ImportWindow = { count: 0, startedAt: null }
   records = new Map<string, HashRecord>()
+
   state(hash: string): CreditState {
-    return { count: this.count, record: this.records.get(hash) ?? null }
+    return { window: this.window, record: this.records.get(hash) ?? null }
   }
+
   apply(hash: string, next: CreditState): void {
-    this.count = next.count
+    this.window = next.window
     if (next.record) this.records.set(hash, next.record)
   }
 }
 
-/** Gate + (on success) commit, mirroring the route/run-DO order. */
-const consume = (
-  store: MeterStore,
-  hash: string,
-  opts: { isSupporter?: boolean; isRefinement?: boolean } = {}
-): CreditDecision => {
-  const isSupporter = opts.isSupporter ?? false
-  const isRefinement = opts.isRefinement ?? false
-  const decision = decideCredit({
-    state: store.state(hash),
-    isSupporter,
-    isRefinement,
-    freeCredits: FREE,
-    maxRefinements: MAXREF,
-  })
-  if (!decision.allowed) return decision
-  const { state: next, remaining } = computeCommit({
-    decision,
-    state: store.state(hash),
-    isSupporter,
-    freeCredits: FREE,
-  })
-  store.apply(hash, next)
-  return { ...decision, remaining }
+interface MeterOptions {
+  importLimit?: Allowance
+  refinementLimit?: Allowance
+  isRefinement?: boolean
+  isEmpty?: boolean
+  emptyCount?: number
+  emptyLimit?: number
 }
 
-describe('credit metering — non-supporter', () => {
-  it('allows exactly 5 distinct imports then blocks the 6th', () => {
+const decide = (
+  store: MeterStore,
+  hash: string,
+  now: number,
+  options: MeterOptions = {}
+): CreditDecision =>
+  decideCredit({
+    state: store.state(hash),
+    isRefinement: options.isRefinement ?? false,
+    importLimit: options.importLimit ?? DEFAULT_IMPORTS,
+    refinementLimit: options.refinementLimit ?? DEFAULT_REFINEMENTS,
+    now,
+    windowDurationMs: WINDOW_MS,
+  })
+
+const settle = (
+  store: MeterStore,
+  hash: string,
+  now: number,
+  options: MeterOptions = {}
+) => {
+  const decision = decide(store, hash, now, options)
+  if (!decision.allowed) return { decision, commit: null }
+  const commit = computeCommit({
+    decision,
+    state: store.state(hash),
+    importLimit: options.importLimit ?? DEFAULT_IMPORTS,
+    now,
+    windowDurationMs: WINDOW_MS,
+    empty: options.isEmpty
+      ? {
+          isEmpty: true,
+          countInWindow: options.emptyCount ?? 0,
+          limit: options.emptyLimit ?? 5,
+        }
+      : undefined,
+  })
+  store.apply(hash, commit.state)
+  return { decision, commit }
+}
+
+const snapshot = (
+  store: MeterStore,
+  hash: string,
+  now: number,
+  options: MeterOptions & { isSupporter?: boolean } = {}
+) =>
+  computeCreditsSnapshot({
+    state: store.state(hash),
+    isSupporter: options.isSupporter ?? false,
+    importLimit: options.importLimit ?? DEFAULT_IMPORTS,
+    refinementLimit: options.refinementLimit ?? DEFAULT_REFINEMENTS,
+    now,
+    windowDurationMs: WINDOW_MS,
+  })
+
+describe('fixed import window', () => {
+  it('expires at the exact reset boundary, but not one millisecond before', () => {
+    const window = { count: 3, startedAt: JULY_1 }
+    const resetsAt = JULY_1 + WINDOW_MS
+
+    expect(normalizeImportWindow(window, resetsAt - 1, WINDOW_MS)).toEqual(window)
+    expect(normalizeImportWindow(window, resetsAt, WINDOW_MS)).toEqual({
+      count: 0,
+      startedAt: null,
+    })
+  })
+
+  it('anchors only when the first brand-new import succeeds', () => {
+    const store = new MeterStore()
+    const decision = decide(store, 'new', JULY_1)
+    expect(decision.allowed).toBe(true)
+    expect(store.window).toEqual({ count: 0, startedAt: null })
+    expect(
+      computeKickoffCredits({
+        decision,
+        state: store.state('new'),
+        isSupporter: false,
+        importLimit: 5,
+        refinementLimit: 5,
+        now: JULY_1,
+        windowDurationMs: WINDOW_MS,
+      })
+    ).toEqual({
+      remaining: 4,
+      limit: 5,
+      resetsAt: null,
+      isSupporter: false,
+      refinements: { remaining: 5, limit: 5 },
+    })
+
+    const commit = computeCommit({
+      decision,
+      state: store.state('new'),
+      importLimit: 5,
+      now: JULY_1 + 1_000,
+      windowDurationMs: WINDOW_MS,
+    })
+    store.apply('new', commit.state)
+    expect(store.window).toEqual({ count: 1, startedAt: JULY_1 + 1_000 })
+    expect(snapshot(store, 'new', JULY_1 + 1_000)).toEqual({
+      remaining: 4,
+      limit: 5,
+      resetsAt: new Date(JULY_1 + 1_000 + WINDOW_MS).toISOString(),
+      isSupporter: false,
+      refinements: { remaining: 5, limit: 5 },
+    })
+  })
+
+  it('allows five finite imports, clamps bounded overage, then denies new hashes', () => {
     const store = new MeterStore()
     const remainings: (number | null)[] = []
     for (let i = 0; i < 5; i++) {
-      const r = consume(store, `hash-${i}`)
-      expect(r.allowed).toBe(true)
-      remainings.push(r.remaining ?? null)
+      const result = settle(store, `hash-${i}`, JULY_1 + i)
+      expect(result.decision.allowed).toBe(true)
+      remainings.push(snapshot(store, `hash-${i}`, JULY_1 + i).remaining)
     }
     expect(remainings).toEqual([4, 3, 2, 1, 0])
+    expect(decide(store, 'sixth', JULY_1 + 10).reason).toBe('limit_reached')
 
-    const sixth = consume(store, 'hash-5')
-    expect(sixth.allowed).toBe(false)
-    expect(sixth.reason).toBe('limit_reached')
-  })
-
-  it('replays a charged hash for free even after the limit is hit', () => {
-    const store = new MeterStore()
-    for (let i = 0; i < 5; i++) consume(store, `hash-${i}`)
-    // Already at the cap; replaying an existing hash is still allowed + free.
-    const replay = consume(store, 'hash-0')
-    expect(replay.allowed).toBe(true)
-    expect(replay.isNewHash).toBe(false)
-    expect(store.count).toBe(5) // no extra charge
-  })
-
-  it('isolates counts per identity', () => {
-    // Distinct users are distinct DO instances → distinct stores.
-    const u1 = new MeterStore()
-    const u2 = new MeterStore()
-    for (let i = 0; i < 5; i++) consume(u1, `h-${i}`)
-    expect(consume(u2, 'h-0').allowed).toBe(true)
-  })
-})
-
-describe('credit metering — refinements', () => {
-  it('treats follow-up refinements as free but caps them', () => {
-    const store = new MeterStore()
-    consume(store, 'hash-x') // original import, costs 1 credit
-    for (let i = 0; i < MAXREF; i++) {
-      const r = consume(store, 'hash-x', { isRefinement: true })
-      expect(r.allowed).toBe(true)
-      expect(r.isRefinement).toBe(true)
-    }
-    const overflow = consume(store, 'hash-x', { isRefinement: true })
-    expect(overflow.allowed).toBe(false)
-    expect(overflow.reason).toBe('refinement_limit')
-  })
-
-  it('does not spend a credit on any refinement', () => {
-    const store = new MeterStore()
-    consume(store, 'hash-x')
-    consume(store, 'hash-x', { isRefinement: true })
-    // Four more distinct originals should still be allowed (only 1 spent).
-    for (let i = 0; i < 4; i++) {
-      expect(consume(store, `other-${i}`).allowed).toBe(true)
-    }
-    expect(consume(store, 'one-too-many').allowed).toBe(false)
-  })
-
-  it('reports the authoritative refinement allowance for a source hash', () => {
-    const store = new MeterStore()
-    consume(store, 'hash-x')
-    expect(refinementUsage(store.state('hash-x').record, MAXREF)).toEqual({
-      remaining: 5,
-      limit: 5,
-    })
-
-    consume(store, 'hash-x', { isRefinement: true })
-    consume(store, 'hash-x', { isRefinement: true })
-    expect(refinementUsage(store.state('hash-x').record, MAXREF)).toEqual({
-      remaining: 3,
-      limit: 5,
-    })
-  })
-})
-
-describe('credit metering — supporter', () => {
-  it('never blocks and reports unlimited (null) remaining', () => {
-    const store = new MeterStore()
-    for (let i = 0; i < 12; i++) {
-      const r = consume(store, `hash-${i}`, { isSupporter: true })
-      expect(r.allowed).toBe(true)
-      expect(r.remaining).toBeNull()
-    }
-    expect(store.count).toBe(0) // supporters never charge
-  })
-})
-
-describe('computeCommit — idempotency + atomicity', () => {
-  it('charges a new hash at most once (re-commit is a no-op)', () => {
-    const store = new MeterStore()
-    const decision = decideCredit({
-      state: store.state('h'),
-      isSupporter: false,
+    const staleA = decideCredit({
+      state: { window: { count: 4, startedAt: JULY_1 }, record: null },
       isRefinement: false,
-      freeCredits: FREE,
-      maxRefinements: MAXREF,
+      importLimit: 5,
+      refinementLimit: 5,
+      now: JULY_1 + 10,
+      windowDurationMs: WINDOW_MS,
     })
-    // First commit charges.
-    const first = computeCommit({
-      decision,
-      state: store.state('h'),
-      isSupporter: false,
-      freeCredits: FREE,
-    })
-    store.apply('h', first.state)
-    expect(store.count).toBe(1)
-    // Replaying the SAME frozen decision must not double-charge (charged flag).
-    const second = computeCommit({
-      decision,
-      state: store.state('h'),
-      isSupporter: false,
-      freeCredits: FREE,
-    })
-    store.apply('h', second.state)
-    expect(store.count).toBe(1)
-    expect(second.remaining).toBe(4)
-  })
-
-  it('never loses an increment when commits are serialized (bounded overage)', () => {
-    // Simulate a concurrent burst: 4 credits already spent, cap allows 2 more
-    // distinct-hash imports in flight. BOTH pass the pre-flight gate on the same
-    // stale count (4 < 5). With the atomic DO, their commits run serialized —
-    // each reads fresh state — so BOTH increments land (5 then 6): no lost write
-    // (the old KV read-modify-write would have dropped one). The residual is a
-    // BOUNDED overage of at most cap-1 past the free limit, by design.
-    const store = new MeterStore()
-    for (let i = 0; i < 4; i++) consume(store, `seed-${i}`)
-    expect(store.count).toBe(4)
-
-    const dA = decideCredit({
-      state: { count: 4, record: null },
-      isSupporter: false,
-      isRefinement: false,
-      freeCredits: FREE,
-      maxRefinements: MAXREF,
-    })
-    const dB = decideCredit({
-      state: { count: 4, record: null },
-      isSupporter: false,
-      isRefinement: false,
-      freeCredits: FREE,
-      maxRefinements: MAXREF,
-    })
-    expect(dA.allowed && dB.allowed).toBe(true)
-
-    // Serialized commits (the DO's single thread), each reading fresh state.
-    const a = computeCommit({
-      decision: dA,
-      state: store.state('a'),
-      isSupporter: false,
-      freeCredits: FREE,
-    })
-    store.apply('a', a.state)
-    const b = computeCommit({
-      decision: dB,
-      state: store.state('b'),
-      isSupporter: false,
-      freeCredits: FREE,
-    })
-    store.apply('b', b.state)
-
-    expect(store.count).toBe(6) // both landed — no lost increment
-    // The next NEW hash is now correctly denied.
-    expect(consume(store, 'c').allowed).toBe(false)
-  })
-})
-
-describe('empty-import grace (ADR 0012)', () => {
-  const newHashDecision = (store: MeterStore, hash: string): CreditDecision =>
-    decideCredit({
-      state: store.state(hash),
-      isSupporter: false,
-      isRefinement: false,
-      freeCredits: FREE,
-      maxRefinements: MAXREF,
-    })
-
-  it('does not charge a within-window empty, but flags it to be logged', () => {
-    const store = new MeterStore()
-    const decision = newHashDecision(store, 'h')
-    const commit = computeCommit({
-      decision,
-      state: store.state('h'),
-      isSupporter: false,
-      freeCredits: FREE,
-      empty: { isEmpty: true, countInWindow: 0, limit: 5 },
-    })
-    expect(commit.emptyCharged).toBe(false)
-    expect(commit.recordsEmptyRun).toBe(true)
-    expect(commit.remaining).toBe(5) // untouched — no credit spent
-    store.apply('h', commit.state)
-    expect(store.count).toBe(0)
-    expect(store.records.size).toBe(0) // the empty hash is NOT recorded
-  })
-
-  it('charges an empty once the window is exhausted (soft degrade)', () => {
-    const store = new MeterStore()
-    const decision = newHashDecision(store, 'h')
-    const commit = computeCommit({
-      decision,
-      state: store.state('h'),
-      isSupporter: false,
-      freeCredits: FREE,
-      empty: { isEmpty: true, countInWindow: 5, limit: 5 },
-    })
-    expect(commit.emptyCharged).toBe(true)
-    expect(commit.recordsEmptyRun).toBe(true)
-    expect(commit.remaining).toBe(4) // charged like a normal new hash
-    store.apply('h', commit.state)
-    expect(store.count).toBe(1)
-  })
-
-  it('gives 5 free empties then charges the 6th, keeping the hashes unrecorded', () => {
-    // Mirror the DO's recordUsage loop over a stream of DISTINCT empty pastes.
-    const store = new MeterStore()
-    let windowRuns = 0
-    const runEmpty = (hash: string) => {
-      const decision = newHashDecision(store, hash)
-      expect(decision.allowed).toBe(true) // empties never deplete credits → never gate
+    const staleB = { ...staleA }
+    const concurrent = new MeterStore()
+    concurrent.window = { count: 4, startedAt: JULY_1 }
+    for (const [hash, decision] of [
+      ['a', staleA],
+      ['b', staleB],
+    ] as const) {
       const commit = computeCommit({
         decision,
-        state: store.state(hash),
-        isSupporter: false,
-        freeCredits: FREE,
-        empty: { isEmpty: true, countInWindow: windowRuns, limit: 5 },
+        state: concurrent.state(hash),
+        importLimit: 5,
+        now: JULY_1 + 20,
+        windowDurationMs: WINDOW_MS,
       })
-      if (commit.recordsEmptyRun) windowRuns++
-      store.apply(hash, commit.state)
-      return commit
+      concurrent.apply(hash, commit.state)
     }
-    for (let i = 0; i < 5; i++) expect(runEmpty(`empty-${i}`).emptyCharged).toBe(false)
-    expect(store.count).toBe(0) // nothing charged across 5 free empties
-    expect(store.records.size).toBe(0) // and none recorded → a re-paste flows fresh
-
-    const sixth = runEmpty('empty-5')
-    expect(sixth.emptyCharged).toBe(true)
-    expect(store.count).toBe(1)
+    expect(concurrent.window.count).toBe(6)
+    expect(snapshot(concurrent, 'b', JULY_1 + 20).remaining).toBe(0)
   })
 
-  it('never applies the grace to a supporter (nothing to save)', () => {
+  it('lazily rolls an expired window on the next successful charge', () => {
     const store = new MeterStore()
-    const decision = decideCredit({
-      state: store.state('h'),
-      isSupporter: true,
-      isRefinement: false,
-      freeCredits: FREE,
-      maxRefinements: MAXREF,
+    settle(store, 'old', JULY_1)
+    settle(store, 'old-2', JULY_1 + 1)
+    const afterExpiry = JULY_1 + WINDOW_MS
+
+    expect(decide(store, 'next', afterExpiry).remaining).toBe(4)
+    expect(store.window).toEqual({ count: 2, startedAt: JULY_1 })
+
+    const { commit } = settle(store, 'next', afterExpiry)
+    expect(commit?.rollover).toEqual({
+      previousCount: 2,
+      previousResetsAt: new Date(afterExpiry).toISOString(),
+      newResetsAt: new Date(afterExpiry + WINDOW_MS).toISOString(),
     })
-    const commit = computeCommit({
-      decision,
-      state: store.state('h'),
-      isSupporter: true,
-      freeCredits: FREE,
-      empty: { isEmpty: true, countInWindow: 0, limit: 5 },
-    })
-    expect(commit.recordsEmptyRun).toBe(false)
-    expect(commit.emptyCharged).toBe(false)
-    expect(commit.remaining).toBeNull()
+    expect(store.window).toEqual({ count: 1, startedAt: afterExpiry })
   })
 
-  it('never applies the grace to a refinement or a replay', () => {
+  it('keeps a charged hash replayable for free across later windows', () => {
     const store = new MeterStore()
-    consume(store, 'h') // charge the original
-    const refDecision = decideCredit({
-      state: store.state('h'),
-      isSupporter: false,
-      isRefinement: true,
-      freeCredits: FREE,
-      maxRefinements: MAXREF,
-    })
-    const refCommit = computeCommit({
-      decision: refDecision,
-      state: store.state('h'),
-      isSupporter: false,
-      freeCredits: FREE,
-      empty: { isEmpty: true, countInWindow: 0, limit: 5 },
-    })
-    expect(refCommit.recordsEmptyRun).toBe(false) // refinements never charge anyway
+    settle(store, 'known', JULY_1)
+    const later = JULY_1 + 2 * WINDOW_MS
+    const replay = settle(store, 'known', later)
+    expect(replay.decision.allowed).toBe(true)
+    expect(replay.decision.isNewHash).toBe(false)
+    expect(store.window).toEqual({ count: 1, startedAt: JULY_1 })
+    expect(snapshot(store, 'known', later).resetsAt).toBeNull()
+  })
 
-    // A replay of the already-charged hash must not be double-charged nor logged.
-    const replayDecision = newHashDecision(store, 'h') // record exists but isNewHash=false
-    const replayCommit = computeCommit({
-      decision: replayDecision,
-      state: store.state('h'),
-      isSupporter: false,
-      freeCredits: FREE,
-      empty: { isEmpty: true, countInWindow: 0, limit: 5 },
-    })
-    expect(replayCommit.recordsEmptyRun).toBe(false)
-    expect(replayCommit.emptyCharged).toBe(false)
+  it('does not anchor or charge a failed/cancelled run because it is never committed', () => {
+    const store = new MeterStore()
+    expect(decide(store, 'failed', JULY_1).allowed).toBe(true)
+    expect(decide(store, 'cancelled', JULY_1 + 1).allowed).toBe(true)
+    expect(store.window).toEqual({ count: 0, startedAt: null })
+    expect(store.records.size).toBe(0)
   })
 })
 
-describe('kickoff credits snapshot', () => {
-  /**
-   * Gate, snapshot the credits as the kickoff returns them (read-only,
-   * pre-charge), THEN commit + build the snapshot as the `done` event does.
-   * The two must be identical — that's the whole contract: showing the meter at
-   * kickoff must not flicker when `done` lands.
-   */
-  const gateThenSettle = (
-    store: MeterStore,
-    hash: string,
-    opts: { supporter?: boolean; unmetered?: boolean; isRefinement?: boolean } = {}
-  ) => {
-    const supporter = opts.supporter ?? false
-    // Route passes `unmetered` (supporter OR dev bypass) to the gate + recorder.
-    const unmetered = opts.unmetered ?? supporter
-    const isRefinement = opts.isRefinement ?? false
-    const decision = decideCredit({
-      state: store.state(hash),
-      isSupporter: unmetered,
-      isRefinement,
-      freeCredits: FREE,
-      maxRefinements: MAXREF,
+describe('effective -1/0/N allowances', () => {
+  it('blocks a brand-new hash at zero but permits a known replay', () => {
+    const store = new MeterStore()
+    settle(store, 'known', JULY_1)
+    expect(decide(store, 'new', JULY_1 + 1, { importLimit: 0 })).toMatchObject({
+      allowed: false,
+      reason: 'limit_reached',
+      remaining: 0,
     })
-    expect(decision.allowed).toBe(true)
-    const atKickoff = computeKickoffCredits({
-      decision,
-      record: store.state(hash).record,
-      isSupporter: supporter,
-      unmetered,
-      freeCredits: FREE,
-      maxRefinements: MAXREF,
+    expect(decide(store, 'known', JULY_1 + 1, { importLimit: 0 }).allowed).toBe(
+      true
+    )
+    expect(snapshot(store, 'known', JULY_1 + 1, { importLimit: 0 })).toMatchObject({
+      remaining: 0,
+      limit: 0,
+      resetsAt: null,
     })
-    const { state: next, remaining } = computeCommit({
-      decision,
-      state: store.state(hash),
-      isSupporter: unmetered,
-      freeCredits: FREE,
-    })
-    store.apply(hash, next)
-    const refinements = refinementUsage(store.state(hash).record, MAXREF)
-    const atDone = {
-      remaining,
-      limit: unmetered ? null : FREE,
-      isSupporter: supporter,
-      refinements,
+  })
+
+  it('records unlimited imports without consuming or anchoring window usage', () => {
+    const store = new MeterStore()
+    for (let i = 0; i < 12; i++) {
+      expect(settle(store, `hash-${i}`, JULY_1 + i, { importLimit: -1 }).decision.allowed).toBe(
+        true
+      )
     }
-    return { atKickoff, atDone }
-  }
-
-  it('matches the done snapshot for a new import', () => {
-    const store = new MeterStore()
-    const { atKickoff, atDone } = gateThenSettle(store, 'hash-new')
-    expect(atKickoff).toEqual({
-      remaining: 4,
-      limit: 5,
-      isSupporter: false,
-      refinements: { remaining: 5, limit: 5 },
-    })
-    expect(atKickoff).toEqual(atDone)
-  })
-
-  it('folds in the pending refinement so it matches the done snapshot', () => {
-    const store = new MeterStore()
-    consume(store, 'hash-x') // original import
-    const { atKickoff, atDone } = gateThenSettle(store, 'hash-x', {
-      isRefinement: true,
-    })
-    // The credit isn't re-spent (4 left), and the refinement allowance already
-    // reflects this in-flight one (4 left, not the pre-charge 5).
-    expect(atKickoff).toEqual({
-      remaining: 4,
-      limit: 5,
-      isSupporter: false,
-      refinements: { remaining: 4, limit: 5 },
-    })
-    expect(atKickoff).toEqual(atDone)
-  })
-
-  it('leaves the refinement count untouched for a free replay', () => {
-    const store = new MeterStore()
-    consume(store, 'hash-x')
-    const { atKickoff, atDone } = gateThenSettle(store, 'hash-x')
-    expect(atKickoff.refinements).toEqual({ remaining: 5, limit: 5 })
-    expect(atKickoff).toEqual(atDone)
-  })
-
-  it('reports unlimited for a real supporter', () => {
-    const store = new MeterStore()
-    const { atKickoff, atDone } = gateThenSettle(store, 'hash-s', {
-      supporter: true,
-    })
-    expect(atKickoff).toEqual({
+    expect(store.window).toEqual({ count: 0, startedAt: null })
+    expect(store.records.size).toBe(12)
+    expect(snapshot(store, 'hash-0', JULY_1 + 20, { importLimit: -1 })).toMatchObject({
       remaining: null,
       limit: null,
+      resetsAt: null,
+    })
+  })
+
+  it('selects a changed tier limit against the existing shared window', () => {
+    const store = new MeterStore()
+    settle(store, 'a', JULY_1, { importLimit: 5 })
+    settle(store, 'b', JULY_1 + 1, { importLimit: 5 })
+
+    expect(decide(store, 'c', JULY_1 + 2, { importLimit: 2 }).allowed).toBe(false)
+    expect(decide(store, 'c', JULY_1 + 2, { importLimit: 3 }).allowed).toBe(true)
+    expect(store.window).toEqual({ count: 2, startedAt: JULY_1 })
+  })
+
+  it('keeps real Supporter status independent from unlimited dev-bypass allowances', () => {
+    const supporterStore = new MeterStore()
+    const devStore = new MeterStore()
+    settle(supporterStore, 's', JULY_1, {
+      importLimit: -1,
+      refinementLimit: -1,
+    })
+    settle(devStore, 'd', JULY_1, {
+      importLimit: -1,
+      refinementLimit: -1,
+    })
+
+    expect(
+      snapshot(supporterStore, 's', JULY_1, {
+        isSupporter: true,
+        importLimit: -1,
+        refinementLimit: -1,
+      })
+    ).toEqual({
+      remaining: null,
+      limit: null,
+      resetsAt: null,
       isSupporter: true,
-      refinements: { remaining: 5, limit: 5 },
+      refinements: { remaining: null, limit: null },
     })
-    expect(atKickoff).toEqual(atDone)
+    expect(
+      snapshot(devStore, 'd', JULY_1, {
+        isSupporter: false,
+        importLimit: -1,
+        refinementLimit: -1,
+      }).isSupporter
+    ).toBe(false)
   })
+})
 
-  it('keeps isSupporter false for an unmetered dev bypass', () => {
-    const store = new MeterStore()
-    const { atKickoff, atDone } = gateThenSettle(store, 'hash-d', {
-      supporter: false,
-      unmetered: true,
-    })
-    expect(atKickoff).toEqual({
+describe('per-import refinement allowances', () => {
+  it('supports finite, zero, and unlimited refinement limits without spending imports', () => {
+    const finite = new MeterStore()
+    settle(finite, 'hash', JULY_1)
+    for (let i = 0; i < 5; i++) {
+      expect(
+        settle(finite, 'hash', JULY_1 + i + 1, { isRefinement: true }).decision
+          .allowed
+      ).toBe(true)
+    }
+    expect(decide(finite, 'hash', JULY_1 + 10, { isRefinement: true }).reason).toBe(
+      'refinement_limit'
+    )
+    expect(finite.window.count).toBe(1)
+
+    const zero = new MeterStore()
+    settle(zero, 'hash', JULY_1)
+    expect(
+      decide(zero, 'hash', JULY_1 + 1, {
+        isRefinement: true,
+        refinementLimit: 0,
+      }).reason
+    ).toBe('refinement_limit')
+    expect(decide(zero, 'hash', JULY_1 + 1, { refinementLimit: 0 }).allowed).toBe(
+      true
+    )
+
+    const unlimited = new MeterStore()
+    settle(unlimited, 'hash', JULY_1)
+    for (let i = 0; i < 12; i++) {
+      settle(unlimited, 'hash', JULY_1 + i + 1, {
+        isRefinement: true,
+        refinementLimit: -1,
+      })
+    }
+    expect(unlimited.records.get('hash')?.refinements).toBe(12)
+    expect(refinementUsage(unlimited.records.get('hash')!, -1)).toEqual({
       remaining: null,
       limit: null,
-      isSupporter: false,
-      refinements: { remaining: 5, limit: 5 },
     })
-    expect(atKickoff).toEqual(atDone)
+  })
+
+  it('folds a pending finite refinement into kickoff while terminal stays authoritative', () => {
+    const store = new MeterStore()
+    settle(store, 'hash', JULY_1)
+    const decision = decide(store, 'hash', JULY_1 + 1, { isRefinement: true })
+    const kickoff = computeKickoffCredits({
+      decision,
+      state: store.state('hash'),
+      isSupporter: false,
+      importLimit: 5,
+      refinementLimit: 5,
+      now: JULY_1 + 1,
+      windowDurationMs: WINDOW_MS,
+    })
+    expect(kickoff.refinements).toEqual({ remaining: 4, limit: 5 })
+
+    settle(store, 'hash', JULY_1 + 2, { isRefinement: true })
+    expect(snapshot(store, 'hash', JULY_1 + 2).refinements).toEqual({
+      remaining: 4,
+      limit: 5,
+    })
+  })
+})
+
+describe('Empty Import grace', () => {
+  it('does not charge, anchor, or record a within-grace Empty Import', () => {
+    const store = new MeterStore()
+    const { commit } = settle(store, 'empty', JULY_1, {
+      isEmpty: true,
+      emptyCount: 0,
+      emptyLimit: 5,
+    })
+    expect(commit).toMatchObject({ emptyCharged: false, recordsEmptyRun: true })
+    expect(store.window).toEqual({ count: 0, startedAt: null })
+    expect(store.records.size).toBe(0)
+  })
+
+  it('charges and anchors an Empty Import after the separate grace is exhausted', () => {
+    const store = new MeterStore()
+    const { commit } = settle(store, 'empty', JULY_1, {
+      isEmpty: true,
+      emptyCount: 5,
+      emptyLimit: 5,
+    })
+    expect(commit).toMatchObject({ emptyCharged: true, recordsEmptyRun: true })
+    expect(store.window).toEqual({ count: 1, startedAt: JULY_1 })
+    expect(store.records.get('empty')?.charged).toBe(true)
+  })
+
+  it('does not apply grace bookkeeping when unlimited usage had nothing to charge', () => {
+    const store = new MeterStore()
+    const { commit } = settle(store, 'empty', JULY_1, {
+      importLimit: -1,
+      isEmpty: true,
+    })
+    expect(commit).toMatchObject({ emptyCharged: false, recordsEmptyRun: false })
+    expect(store.records.has('empty')).toBe(true)
   })
 })

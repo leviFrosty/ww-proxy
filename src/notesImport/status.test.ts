@@ -6,6 +6,7 @@ import {
   type StatusKv,
 } from './status'
 import type { NotesImportConfig } from './config'
+import type { Environment } from '../types'
 import { makeMemoryKv } from '../test/memoryKv'
 
 const CONFIG: NotesImportConfig = {
@@ -13,15 +14,23 @@ const CONFIG: NotesImportConfig = {
   providers: ['fireworks', 'digitalocean'],
   maxChars: 100_000,
   maxOutputTokens: 16_000,
-  freeCredits: 5,
-  maxRefinements: 5,
+  emptyWindowSeconds: 604_800,
+  emptyWindowLimit: 5,
   entitlementId: 'Supporter',
   devBypassToken: null,
+  requireProduction: true,
   activeImportCap: 2,
   activeImportCapSupporter: 5,
   resultRetentionSeconds: 3_600,
   subscribeTokenTtlSeconds: 3_600,
   reasoningEffort: 'low',
+}
+
+const ENV = {} as Environment
+const DEFAULT_PUBLIC_LIMITS = {
+  imports: { free: 5, supporter: null },
+  refinements: { free: 5, supporter: null },
+  windowDays: 30,
 }
 
 const endpointsBody = (
@@ -33,54 +42,52 @@ const okFetch = (body: OpenRouterEndpointsResponse): typeof fetch =>
     new Response(JSON.stringify(body), { status: 200 })
   ) as unknown as typeof fetch
 
+const getStatus = (
+  kv: ReturnType<typeof makeMemoryKv>,
+  fetchFn: typeof fetch
+) =>
+  getNotesImportStatus({
+    kv: kv as unknown as StatusKv,
+    env: ENV,
+    apiKey: 'k',
+    config: CONFIG,
+    fetchFn,
+  })
+
 describe('anyAllowlistedProviderHealthy', () => {
-  it('true when an allowlisted provider is healthy (status 0)', () => {
-    const body = endpointsBody([{ provider_name: 'Fireworks', status: 0 }])
-    expect(anyAllowlistedProviderHealthy(body, CONFIG.providers)).toBe(true)
+  it('uses only a healthy allowlisted provider', () => {
+    expect(
+      anyAllowlistedProviderHealthy(
+        endpointsBody([{ provider_name: 'Fireworks', status: 0 }]),
+        CONFIG.providers
+      )
+    ).toBe(true)
+    expect(
+      anyAllowlistedProviderHealthy(
+        endpointsBody([{ provider_name: 'DeepInfra', status: 0 }]),
+        CONFIG.providers
+      )
+    ).toBe(false)
+    expect(
+      anyAllowlistedProviderHealthy(
+        endpointsBody([{ provider_name: 'Fireworks', status: -1 }]),
+        CONFIG.providers
+      )
+    ).toBe(false)
   })
 
-  it('false when the only allowlisted provider is degraded (negative status)', () => {
-    const body = endpointsBody([{ provider_name: 'DeepInfra', status: -1 }])
-    expect(anyAllowlistedProviderHealthy(body, CONFIG.providers)).toBe(false)
-  })
-
-  it('ignores healthy providers that are NOT on the allowlist', () => {
-    // DeepInfra is deliberately off the allowlist (mislabels reasoning), so a
-    // healthy DeepInfra endpoint must NOT count toward provider health.
-    const body = endpointsBody([{ provider_name: 'DeepInfra', status: 0 }])
-    expect(anyAllowlistedProviderHealthy(body, CONFIG.providers)).toBe(false)
-  })
-
-  it('matches provider names loosely (case/spacing insensitive)', () => {
-    const body = endpointsBody([{ provider_name: 'Digital Ocean', status: 0 }])
-    expect(anyAllowlistedProviderHealthy(body, CONFIG.providers)).toBe(true)
-  })
-
-  it('false for an empty endpoint list', () => {
-    expect(anyAllowlistedProviderHealthy(endpointsBody([]), CONFIG.providers)).toBe(
-      false
-    )
+  it('matches provider names case/spacing-insensitively', () => {
+    expect(
+      anyAllowlistedProviderHealthy(
+        endpointsBody([{ provider_name: 'Digital Ocean', status: 0 }]),
+        CONFIG.providers
+      )
+    ).toBe(true)
   })
 })
 
-describe('getNotesImportStatus — kill-switch', () => {
-  it('reports disabled when the KV flag is off, without probing providers', async () => {
-    const kv = makeMemoryKv()
-    await kv.put('notes-import:enabled', 'false')
-    const fetchFn = vi.fn() as unknown as typeof fetch
-
-    const res = await getNotesImportStatus({
-      kv: kv as unknown as StatusKv,
-      apiKey: 'k',
-      config: CONFIG,
-      fetchFn,
-    })
-
-    expect(res).toEqual({ available: false, reason: 'disabled' })
-    expect(fetchFn).not.toHaveBeenCalled()
-  })
-
-  it('reports disabled with operator reason from a JSON record, without probing', async () => {
+describe('getNotesImportStatus — discriminated schedule', () => {
+  it('returns no limits when the kill-switch is unavailable', async () => {
     const kv = makeMemoryKv()
     await kv.put(
       'notes-import:enabled',
@@ -88,105 +95,168 @@ describe('getNotesImportStatus — kill-switch', () => {
     )
     const fetchFn = vi.fn() as unknown as typeof fetch
 
-    const res = await getNotesImportStatus({
-      kv: kv as unknown as StatusKv,
-      apiKey: 'k',
-      config: CONFIG,
-      fetchFn,
+    await expect(getStatus(kv, fetchFn)).resolves.toEqual({
+      available: false,
+      reason: 'down for maintenance',
     })
-
-    expect(res).toEqual({ available: false, reason: 'down for maintenance' })
     expect(fetchFn).not.toHaveBeenCalled()
   })
 
-  it('falls through to the provider check when the JSON record is available:true', async () => {
+  it('does not bypass an explicit kill-switch when the later cache read fails', async () => {
+    const kv: StatusKv = {
+      get: vi.fn(async (key: string) => {
+        if (key === 'notes-import:enabled') {
+          return JSON.stringify({ available: false, reason: 'maintenance' })
+        }
+        throw new Error('provider cache unavailable')
+      }) as StatusKv['get'],
+      put: vi.fn() as StatusKv['put'],
+    }
+    const fetchFn = vi.fn() as unknown as typeof fetch
+
+    await expect(
+      getNotesImportStatus({
+        kv,
+        env: ENV,
+        apiKey: 'k',
+        config: CONFIG,
+        fetchFn,
+      })
+    ).resolves.toEqual({ available: false, reason: 'maintenance' })
+    expect(fetchFn).not.toHaveBeenCalled()
+  })
+
+  it('returns the default resolved public schedule when available', async () => {
+    const kv = makeMemoryKv()
+    await expect(
+      getStatus(
+        kv,
+        okFetch(endpointsBody([{ provider_name: 'Fireworks', status: 0 }]))
+      )
+    ).resolves.toEqual({ available: true, limits: DEFAULT_PUBLIC_LIMITS })
+  })
+
+  it('serializes unlimited as null while preserving zero and finite values', async () => {
+    const kv = makeMemoryKv()
+    await kv.put(
+      'notes-import:limits',
+      JSON.stringify({
+        importsFree: 0,
+        importsSupporter: 12,
+        refinementsFree: -1,
+        refinementsSupporter: 0,
+        windowDays: 14.5,
+      })
+    )
+    await expect(
+      getStatus(
+        kv,
+        okFetch(endpointsBody([{ provider_name: 'Fireworks', status: 0 }]))
+      )
+    ).resolves.toEqual({
+      available: true,
+      limits: {
+        imports: { free: 0, supporter: 12 },
+        refinements: { free: null, supporter: 0 },
+        windowDays: 14.5,
+      },
+    })
+  })
+
+  it('falls through available:true kill-switch and still supplies the schedule', async () => {
     const kv = makeMemoryKv()
     await kv.put(
       'notes-import:enabled',
       JSON.stringify({ available: true, reason: '' })
     )
-    const fetchFn = okFetch(
-      endpointsBody([{ provider_name: 'Fireworks', status: 0 }])
-    )
-    const res = await getNotesImportStatus({
-      kv: kv as unknown as StatusKv,
-      apiKey: 'k',
-      config: CONFIG,
-      fetchFn,
-    })
-    expect(res).toEqual({ available: true })
-    expect(fetchFn).toHaveBeenCalledOnce()
-  })
-
-  it('treats an absent flag as enabled', async () => {
-    const kv = makeMemoryKv()
-    const res = await getNotesImportStatus({
-      kv: kv as unknown as StatusKv,
-      apiKey: 'k',
-      config: CONFIG,
-      fetchFn: okFetch(endpointsBody([{ provider_name: 'Fireworks', status: 0 }])),
-    })
-    expect(res.available).toBe(true)
+    await expect(
+      getStatus(
+        kv,
+        okFetch(endpointsBody([{ provider_name: 'Fireworks', status: 0 }]))
+      )
+    ).resolves.toEqual({ available: true, limits: DEFAULT_PUBLIC_LIMITS })
   })
 })
 
-describe('getNotesImportStatus — provider health + caching', () => {
-  it('available when a provider is healthy, and caches "up"', async () => {
+describe('getNotesImportStatus — provider health and caching', () => {
+  it('caches healthy provider status and returns the resolved schedule', async () => {
     const kv = makeMemoryKv()
-    const fetchFn = okFetch(
-      endpointsBody([{ provider_name: 'Fireworks', status: 0 }])
+    const result = await getStatus(
+      kv,
+      okFetch(endpointsBody([{ provider_name: 'Fireworks', status: 0 }]))
     )
-    const res = await getNotesImportStatus({
-      kv: kv as unknown as StatusKv,
-      apiKey: 'k',
-      config: CONFIG,
-      fetchFn,
-    })
-    expect(res).toEqual({ available: true })
+    expect(result).toEqual({ available: true, limits: DEFAULT_PUBLIC_LIMITS })
     expect(kv.store.get('notes-import:provider-health')).toBe('up')
   })
 
-  it('no_provider when all allowlisted providers are down, and caches "down"', async () => {
+  it('returns unavailable without limits and caches when all providers are down', async () => {
     const kv = makeMemoryKv()
-    const fetchFn = okFetch(
-      endpointsBody([{ provider_name: 'Fireworks', status: -1 }])
+    const result = await getStatus(
+      kv,
+      okFetch(endpointsBody([{ provider_name: 'Fireworks', status: -1 }]))
     )
-    const res = await getNotesImportStatus({
-      kv: kv as unknown as StatusKv,
-      apiKey: 'k',
-      config: CONFIG,
-      fetchFn,
-    })
-    expect(res).toEqual({ available: false, reason: 'no_provider' })
+    expect(result).toEqual({ available: false, reason: 'no_provider' })
     expect(kv.store.get('notes-import:provider-health')).toBe('down')
   })
 
-  it('serves a cached result without re-probing', async () => {
+  it('keeps a confirmed unhealthy result when the cache write fails', async () => {
+    const kv: StatusKv = {
+      get: vi.fn(async () => null) as StatusKv['get'],
+      put: vi.fn(async () => {
+        throw new Error('KV write unavailable')
+      }) as StatusKv['put'],
+    }
+
+    await expect(
+      getNotesImportStatus({
+        kv,
+        env: ENV,
+        apiKey: 'k',
+        config: CONFIG,
+        fetchFn: okFetch(
+          endpointsBody([{ provider_name: 'Fireworks', status: -1 }])
+        ),
+      })
+    ).resolves.toEqual({ available: false, reason: 'no_provider' })
+  })
+
+  it('serves a cached up result with schedule without probing', async () => {
     const kv = makeMemoryKv()
-    await kv.put('notes-import:provider-health', 'down')
+    await kv.put('notes-import:provider-health', 'up')
     const fetchFn = vi.fn() as unknown as typeof fetch
-    const res = await getNotesImportStatus({
-      kv: kv as unknown as StatusKv,
-      apiKey: 'k',
-      config: CONFIG,
-      fetchFn,
+    await expect(getStatus(kv, fetchFn)).resolves.toEqual({
+      available: true,
+      limits: DEFAULT_PUBLIC_LIMITS,
     })
-    expect(res).toEqual({ available: false, reason: 'no_provider' })
     expect(fetchFn).not.toHaveBeenCalled()
   })
 
-  it('fails open when the upstream probe errors, and does not cache', async () => {
+  it('fails open without inventing a schedule when the provider probe errors', async () => {
     const kv = makeMemoryKv()
     const fetchFn = vi.fn(async () =>
       new Response('nope', { status: 500 })
     ) as unknown as typeof fetch
-    const res = await getNotesImportStatus({
-      kv: kv as unknown as StatusKv,
-      apiKey: 'k',
-      config: CONFIG,
-      fetchFn,
-    })
-    expect(res).toEqual({ available: true })
+    await expect(getStatus(kv, fetchFn)).resolves.toEqual({ available: true })
     expect(kv.store.has('notes-import:provider-health')).toBe(false)
+  })
+
+  it('fails open without a schedule when status KV cannot be read', async () => {
+    const kv: StatusKv = {
+      get: vi.fn(async () => {
+        throw new Error('KV unavailable')
+      }) as StatusKv['get'],
+      put: vi.fn() as StatusKv['put'],
+    }
+    const fetchFn = vi.fn() as unknown as typeof fetch
+    await expect(
+      getNotesImportStatus({
+        kv,
+        env: ENV,
+        apiKey: 'k',
+        config: CONFIG,
+        fetchFn,
+      })
+    ).resolves.toEqual({ available: true })
+    expect(fetchFn).not.toHaveBeenCalled()
   })
 })

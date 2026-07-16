@@ -108,9 +108,10 @@ becomes a multi-step pipeline.
   append-only SQLite log, and fans out to attached SSE subscribers. `fetch()`
   serves the SSE stream: **replays** the log since `Last-Event-ID`, then tails
   live (lossless resume). Final result retained ~1h, then alarm-based cleanup.
-- `NotesImportIndex` (`src/notesImport/indexDO.ts`) — one per user; enforces the
-  N-concurrent cap race-free (single-threaded `acquire`/`release`) and backs the
-  active-imports list.
+- `NotesImportIndex` (`src/notesImport/indexDO.ts`) — one per meter identity;
+  enforces the N-concurrent cap race-free, backs the active-imports list, and
+  atomically owns the anchored import-window aggregate plus permanent replay /
+  refinement records.
 
 **Flow:** `POST /notes-import/kickoff` (App-Attested, same `contentHash`-bound
 boundary as the legacy path) → gate + cap → start run DO → `{ importId,
@@ -174,9 +175,18 @@ tracked in the index DO's `empty_run` table), returns the credit untouched and
 records no `hash_record` row (so a later re-paste of corrected text still flows as
 a fresh, chargeable import). Past the window it charges again (soft degrade) and
 sets `emptyCharged: true` on the `done` payload, which the client turns into a
-fixed Scribe AI notice. Supporters are unmetered and exempt from the window
-entirely.
+fixed Scribe AI notice. Empty grace applies whenever a finite effective
+allowance would otherwise charge; an unlimited effective allowance has nothing
+to save. Supporter status itself is not a metering bypass.
 
-**One-time deploy:** the new SQLite DO classes need the `v1` migration applied —
-`wrangler deploy` (prod) and `wrangler deploy --env dev` pick it up from
-`[[migrations]]` / `[[env.dev.migrations]]`. No new secrets.
+**Allowance update (issue #428):** imports use a fixed window anchored by the
+first successful finite charge. Runtime policy comes from `NOTES_KV`
+`notes-import:limits` (KV → env → defaults, 60-second edge cache), with `-1` /
+`0` / positive finite semantics for both tiers and refinements. The dedicated,
+rate-limited admin reset route uses a distinct `ADMIN_API_TOKEN` secret per
+environment and preserves permanent hash/refinement records.
+
+**One-time deploy:** the SQLite DO classes use the existing `v1` migration;
+`wrangler deploy` (prod) and `wrangler deploy --env dev` apply it for a new
+environment. Development pre-window aggregate data may be reset; no production
+migration is needed because Scribe has not shipped.
