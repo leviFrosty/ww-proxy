@@ -1,6 +1,13 @@
-/** KV-backed store of attested device public keys, shared by attest + assert. */
+/**
+ * Legacy KV adapter. SQLite identity objects are authoritative; these helpers are
+ * used only for lazy import and the compatibility mirror needed by deployed v1
+ * clients during rolling upgrades.
+ */
 
-export type AppAttestKv = Pick<KVNamespace, 'get' | 'put' | 'delete'>
+export type AppAttestKv = Pick<
+  KVNamespace,
+  'get' | 'put' | 'delete' | 'list'
+>
 
 export interface DeviceKeyRecord {
   /** Base64url SPKI of the device's attested P-256 public key. */
@@ -15,26 +22,81 @@ export interface DeviceKeyRecord {
 
 const keyStoreKey = (keyId: string) => `key:${keyId}`
 
-/**
- * Reverse index pinning an identity (`uuid`) to the ONE `keyId` that first
- * attested it — the security boundary behind `verifyAttestation` (ADR 0007).
- * First-writer-wins: once written it is never rebound automatically, so an
- * attacker can't attest their own key to a victim's uuid. See `getUuidOwner` /
- * `putUuidOwner`.
- */
+/** Legacy reverse index from install UUID to the deployed v1 key id. */
 const uuidOwnerKey = (uuid: string) => `uuidOwner:${uuid}`
+
+const parseKeyRecord = (raw: string): DeviceKeyRecord | null => {
+  try {
+    const value = JSON.parse(raw) as Partial<DeviceKeyRecord>
+    if (
+      typeof value.spki !== 'string' ||
+      !Number.isSafeInteger(value.signCount) ||
+      (value.signCount ?? -1) < 0 ||
+      typeof value.uuid !== 'string' ||
+      (value.environment !== 'development' &&
+        value.environment !== 'production') ||
+      !Number.isFinite(value.attestedAt)
+    ) {
+      return null
+    }
+    return value as DeviceKeyRecord
+  } catch {
+    return null
+  }
+}
 
 export const getKeyRecord = async (
   kv: AppAttestKv,
   keyId: string
 ): Promise<DeviceKeyRecord | null> => {
   const raw = await kv.get(keyStoreKey(keyId))
-  if (!raw) return null
-  try {
-    return JSON.parse(raw) as DeviceKeyRecord
-  } catch {
-    return null
-  }
+  return raw == null ? null : parseKeyRecord(raw)
+}
+
+export interface LegacyDeviceKeyMatch {
+  keyId: string
+  record: DeviceKeyRecord
+}
+
+/**
+ * Scan every legacy key page for records pinned to an install UUID. The caller
+ * decides whether zero, one, or multiple matches are safe for its operation.
+ */
+export const listKeyRecordsForUuid = async (
+  kv: AppAttestKv,
+  uuid: string
+): Promise<LegacyDeviceKeyMatch[]> => {
+  const matches: LegacyDeviceKeyMatch[] = []
+  const seenCursors = new Set<string>()
+  let cursor: string | undefined
+
+  do {
+    const page = await kv.list({
+      prefix: 'key:',
+      ...(cursor == null ? {} : { cursor }),
+    })
+    for (const key of page.keys) {
+      if (!key.name.startsWith('key:')) {
+        throw new Error('legacy App Attest key listing returned wrong prefix')
+      }
+      const keyId = key.name.slice('key:'.length)
+      if (!keyId) throw new Error('legacy App Attest key id is empty')
+      const raw = await kv.get(key.name)
+      if (raw == null) throw new Error('listed legacy App Attest key is missing')
+      const record = parseKeyRecord(raw)
+      if (!record) throw new Error('listed legacy App Attest key is malformed')
+      if (record.uuid === uuid) matches.push({ keyId, record })
+    }
+    if (page.list_complete) break
+    if (!page.cursor) throw new Error('legacy App Attest key listing omitted cursor')
+    if (seenCursors.has(page.cursor)) {
+      throw new Error('legacy App Attest key listing repeated cursor')
+    }
+    seenCursors.add(page.cursor)
+    cursor = page.cursor
+  } while (true)
+
+  return matches
 }
 
 export const putKeyRecord = (
@@ -43,19 +105,18 @@ export const putKeyRecord = (
   record: DeviceKeyRecord
 ): Promise<void> => kv.put(keyStoreKey(keyId), JSON.stringify(record))
 
+export const deleteKeyRecord = (
+  kv: AppAttestKv,
+  keyId: string
+): Promise<void> => kv.delete(keyStoreKey(keyId))
+
 /** The keyId that owns `uuid`, or null if the identity is still unclaimed. */
 export const getUuidOwner = (
   kv: AppAttestKv,
   uuid: string
 ): Promise<string | null> => kv.get(uuidOwnerKey(uuid))
 
-/**
- * Pin `uuid` to `keyId` (first-writer-wins). Caller must only invoke this when
- * the identity is unclaimed OR already owned by this same `keyId`; it never
- * checks — the ownership decision lives in `verifyAttestation`. To manually
- * release a binding (e.g. a legitimate Secure-Enclave key rotation), an operator
- * deletes both `uuidOwner:<uuid>` and `key:<oldKeyId>` from KV.
- */
+/** Update the deployed v1 UUID→key compatibility mirror. */
 export const putUuidOwner = (
   kv: AppAttestKv,
   uuid: string,

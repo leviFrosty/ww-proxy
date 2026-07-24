@@ -29,11 +29,21 @@ export interface Environment {
 
   /**
    * KV namespace backing Notes Import. Stores ONLY non-content metadata:
-   * App Attest challenges + device keys, and short-lived SSE subscribe tokens.
+   * legacy App Attest identity/challenge compatibility records and short-lived
+   * SSE subscribe tokens. New App Attest lifecycle state is authoritative in
+   * `APP_ATTEST_IDENTITY`.
    * Never notes text or model output (ADR 0008). The per-identity credit meter
    * moved OUT of KV into the `NotesImportIndex` DO (atomic, strongly consistent).
    */
   NOTES_KV: KVNamespace;
+
+  /**
+   * Per-install App Attest identity lifecycle. SQLite is authoritative for the
+   * active key, recovery verifier, challenges, operation replay, and counters.
+   */
+  APP_ATTEST_IDENTITY: DurableObjectNamespace<
+    import('./appAttest/identityDO').AppAttestIdentity
+  >;
 
   /**
    * Per-import Durable Object: runs the streaming model call in the background
@@ -57,6 +67,9 @@ export interface Environment {
 
   /** RevenueCat REST v1 secret key (`sk_...`) for server-side supporter checks (secret). */
   REVENUECAT_API_KEY: string;
+
+  /** Explicit Worker environment; production fails closed if a dev bypass exists. */
+  APP_ATTEST_ENVIRONMENT: 'development' | 'production';
 
   /** iOS bundle id, e.g. `com.leviwilkerson.jwtime`. Part of the App Attest app id. */
   IOS_BUNDLE_ID: string;
@@ -155,6 +168,10 @@ export interface ErrorResponse {
   error: string;
   /** Stable machine-readable code so the app can branch (e.g. show the paywall). */
   code?: string;
+  /** Stable App Attest failure reason (additive to the legacy `code`). */
+  reason?: import('./appAttest/errors').AppAttestReason;
+  /** Recovery-safe next action; transient failures never request key rotation. */
+  action?: import('./appAttest/errors').AppAttestAction;
   /**
    * Underlying error detail, surfaced ONLY to dev-bypass callers (i.e. DEV app
    * builds) so the real cause of an otherwise-opaque failure (e.g. `model_error`)

@@ -32,6 +32,9 @@ const DEFAULT_PUBLIC_LIMITS = {
   refinements: { free: 5, supporter: null },
   windowDays: 30,
 }
+const APP_ATTEST_CAPABILITIES = {
+  capabilities: { appAttest: { protocolVersions: [1, 2] } },
+}
 
 const endpointsBody = (
   endpoints: { provider_name: string; status: number }[]
@@ -87,6 +90,39 @@ describe('anyAllowlistedProviderHealthy', () => {
 })
 
 describe('getNotesImportStatus — discriminated schedule', () => {
+  it('advertises App Attest v1 and v2 on available, unavailable, and fail-open results', async () => {
+    const availableKv = makeMemoryKv()
+    await availableKv.put('notes-import:provider-health', 'up')
+    const unavailableKv = makeMemoryKv()
+    await unavailableKv.put('notes-import:provider-health', 'down')
+    const unavailableFetch = vi.fn() as unknown as typeof fetch
+    const failedKv: StatusKv = {
+      get: vi.fn(async () => {
+        throw new Error('KV unavailable')
+      }) as StatusKv['get'],
+      put: vi.fn() as StatusKv['put'],
+    }
+
+    const results = await Promise.all([
+      getStatus(availableKv, unavailableFetch),
+      getStatus(unavailableKv, unavailableFetch),
+      getNotesImportStatus({
+        kv: failedKv,
+        env: ENV,
+        apiKey: 'k',
+        config: CONFIG,
+        fetchFn: unavailableFetch,
+      }),
+    ])
+
+    for (const result of results) {
+      expect(result.capabilities).toEqual({
+        appAttest: { protocolVersions: [1, 2] },
+      })
+    }
+    expect(unavailableFetch).not.toHaveBeenCalled()
+  })
+
   it('returns no limits when the kill-switch is unavailable', async () => {
     const kv = makeMemoryKv()
     await kv.put(
@@ -96,6 +132,7 @@ describe('getNotesImportStatus — discriminated schedule', () => {
     const fetchFn = vi.fn() as unknown as typeof fetch
 
     await expect(getStatus(kv, fetchFn)).resolves.toEqual({
+      ...APP_ATTEST_CAPABILITIES,
       available: false,
       reason: 'down for maintenance',
     })
@@ -122,7 +159,11 @@ describe('getNotesImportStatus — discriminated schedule', () => {
         config: CONFIG,
         fetchFn,
       })
-    ).resolves.toEqual({ available: false, reason: 'maintenance' })
+    ).resolves.toEqual({
+      ...APP_ATTEST_CAPABILITIES,
+      available: false,
+      reason: 'maintenance',
+    })
     expect(fetchFn).not.toHaveBeenCalled()
   })
 
@@ -133,7 +174,11 @@ describe('getNotesImportStatus — discriminated schedule', () => {
         kv,
         okFetch(endpointsBody([{ provider_name: 'Fireworks', status: 0 }]))
       )
-    ).resolves.toEqual({ available: true, limits: DEFAULT_PUBLIC_LIMITS })
+    ).resolves.toEqual({
+      ...APP_ATTEST_CAPABILITIES,
+      available: true,
+      limits: DEFAULT_PUBLIC_LIMITS,
+    })
   })
 
   it('serializes unlimited as null while preserving zero and finite values', async () => {
@@ -154,6 +199,7 @@ describe('getNotesImportStatus — discriminated schedule', () => {
         okFetch(endpointsBody([{ provider_name: 'Fireworks', status: 0 }]))
       )
     ).resolves.toEqual({
+      ...APP_ATTEST_CAPABILITIES,
       available: true,
       limits: {
         imports: { free: 0, supporter: 12 },
@@ -174,7 +220,11 @@ describe('getNotesImportStatus — discriminated schedule', () => {
         kv,
         okFetch(endpointsBody([{ provider_name: 'Fireworks', status: 0 }]))
       )
-    ).resolves.toEqual({ available: true, limits: DEFAULT_PUBLIC_LIMITS })
+    ).resolves.toEqual({
+      ...APP_ATTEST_CAPABILITIES,
+      available: true,
+      limits: DEFAULT_PUBLIC_LIMITS,
+    })
   })
 })
 
@@ -185,7 +235,11 @@ describe('getNotesImportStatus — provider health and caching', () => {
       kv,
       okFetch(endpointsBody([{ provider_name: 'Fireworks', status: 0 }]))
     )
-    expect(result).toEqual({ available: true, limits: DEFAULT_PUBLIC_LIMITS })
+    expect(result).toEqual({
+      ...APP_ATTEST_CAPABILITIES,
+      available: true,
+      limits: DEFAULT_PUBLIC_LIMITS,
+    })
     expect(kv.store.get('notes-import:provider-health')).toBe('up')
   })
 
@@ -195,7 +249,11 @@ describe('getNotesImportStatus — provider health and caching', () => {
       kv,
       okFetch(endpointsBody([{ provider_name: 'Fireworks', status: -1 }]))
     )
-    expect(result).toEqual({ available: false, reason: 'no_provider' })
+    expect(result).toEqual({
+      ...APP_ATTEST_CAPABILITIES,
+      available: false,
+      reason: 'no_provider',
+    })
     expect(kv.store.get('notes-import:provider-health')).toBe('down')
   })
 
@@ -217,7 +275,11 @@ describe('getNotesImportStatus — provider health and caching', () => {
           endpointsBody([{ provider_name: 'Fireworks', status: -1 }])
         ),
       })
-    ).resolves.toEqual({ available: false, reason: 'no_provider' })
+    ).resolves.toEqual({
+      ...APP_ATTEST_CAPABILITIES,
+      available: false,
+      reason: 'no_provider',
+    })
   })
 
   it('serves a cached up result with schedule without probing', async () => {
@@ -225,6 +287,7 @@ describe('getNotesImportStatus — provider health and caching', () => {
     await kv.put('notes-import:provider-health', 'up')
     const fetchFn = vi.fn() as unknown as typeof fetch
     await expect(getStatus(kv, fetchFn)).resolves.toEqual({
+      ...APP_ATTEST_CAPABILITIES,
       available: true,
       limits: DEFAULT_PUBLIC_LIMITS,
     })
@@ -236,7 +299,10 @@ describe('getNotesImportStatus — provider health and caching', () => {
     const fetchFn = vi.fn(async () =>
       new Response('nope', { status: 500 })
     ) as unknown as typeof fetch
-    await expect(getStatus(kv, fetchFn)).resolves.toEqual({ available: true })
+    await expect(getStatus(kv, fetchFn)).resolves.toEqual({
+      ...APP_ATTEST_CAPABILITIES,
+      available: true,
+    })
     expect(kv.store.has('notes-import:provider-health')).toBe(false)
   })
 
@@ -256,7 +322,10 @@ describe('getNotesImportStatus — provider health and caching', () => {
         config: CONFIG,
         fetchFn,
       })
-    ).resolves.toEqual({ available: true })
+    ).resolves.toEqual({
+      ...APP_ATTEST_CAPABILITIES,
+      available: true,
+    })
     expect(fetchFn).not.toHaveBeenCalled()
   })
 })

@@ -6,10 +6,7 @@ import {
 } from './decode'
 import { derEcdsaSignatureToRaw } from './der'
 import { appIdRpHash, bytesEqual } from './appId'
-import { buildAssertionClientData } from './clientData'
-import { consumeChallenge } from './challenge'
 import { AppAttestError } from './errors'
-import { getKeyRecord, putKeyRecord, type AppAttestKv } from './keyStore'
 
 const ECDSA_P256 = { name: 'ECDSA', namedCurve: 'P-256' } as const
 
@@ -20,100 +17,95 @@ const concat = (a: Uint8Array, b: Uint8Array): Uint8Array => {
   return out
 }
 
-export interface VerifyAssertionArgs {
-  kv: AppAttestKv
+export interface VerifyAssertionCryptographyArgs {
   /** Base64 of the CBOR assertion from `DCAppAttestService.generateAssertion`. */
   assertion: string
-  keyId: string
-  challenge: string
-  uuid: string
-  /**
-   * Shared account id (witness-work ADR 0011), when the client sent one. Not
-   * part of the key pinning — that stays on the per-device `uuid` — but it is
-   * folded into the signed client data so a proxying user can't swap in
-   * someone else's account id post-signature.
-   */
-  accountId?: string
-  /** The notes content hash this request is bound to. */
-  contentHash: string
+  /** Base64url SPKI from the key's verified Apple attestation. */
+  spki: string
+  /** Exact domain-separated client data whose SHA-256 the app asserted. */
+  clientData: string
   teamId: string
   bundleId: string
 }
 
+export interface VerifiedAssertion {
+  signCount: number
+}
+
 /**
- * Verifies a per-request App Attest assertion — the hot path on every
- * `/notes-import` call. Pure WebCrypto (no X.509), so it stays cheap. Checks:
- * the device key is known and pinned to `uuid`; the challenge is fresh; the
- * ES256 signature covers `authenticatorData || SHA256(clientData)` for our exact
- * bound client data; the rpIdHash matches our app id; and the sign-count
- * strictly increases. Throws {@link AppAttestError} otherwise.
+ * Pure App Attest assertion verification. Identity ownership, challenge replay,
+ * and monotonic counter policy deliberately live in the lifecycle module.
  */
-export const verifyAssertion = async ({
-  kv,
+export const verifyAssertionCryptography = async ({
   assertion,
-  keyId,
-  challenge,
-  uuid,
-  accountId,
-  contentHash,
+  spki,
+  clientData,
   teamId,
   bundleId,
-}: VerifyAssertionArgs): Promise<void> => {
-  const record = await getKeyRecord(kv, keyId)
-  if (!record) throw new AppAttestError('unknown device key — attest first')
-  if (record.uuid !== uuid) {
-    throw new AppAttestError('device key not bound to this identity')
-  }
-  if (!(await consumeChallenge(kv, challenge))) {
-    throw new AppAttestError('challenge invalid or expired')
-  }
-
+}: VerifyAssertionCryptographyArgs): Promise<VerifiedAssertion> => {
   let asn
   let parsed: ParsedAuthData
   try {
     asn = decodeAssertion(base64ToBytes(assertion))
     parsed = parseAssertionAuthData(asn.authenticatorData)
   } catch (e) {
-    throw new AppAttestError(`malformed assertion: ${(e as Error).message}`)
+    throw new AppAttestError(`malformed assertion: ${(e as Error).message}`, {
+      reason: 'assertion_invalid',
+      cause: e,
+    })
   }
 
   const expectedRpId = await appIdRpHash(teamId, bundleId)
   if (!bytesEqual(parsed.rpIdHash, expectedRpId)) {
-    throw new AppAttestError('rpIdHash mismatch (wrong app id)')
-  }
-  if (parsed.signCount <= record.signCount) {
-    throw new AppAttestError('assertion sign-count did not increase (replay?)')
+    throw new AppAttestError('rpIdHash mismatch (wrong app id)', {
+      reason: 'assertion_invalid',
+    })
   }
 
-  const clientData = buildAssertionClientData({
-    challenge,
-    uuid,
-    accountId,
-    contentHash,
-  })
   const clientDataHash = await sha256Bytes(new TextEncoder().encode(clientData))
   // Apple signs the NONCE ITSELF as the to-be-signed message — the ECDSA
   // digest is SHA256(nonce) = SHA256(SHA256(authData || clientDataHash)), one
   // hash layer more than WebAuthn's assertion scheme. Verified against a real
-  // device capture (see 'verifies a captured real-device assertion' test);
-  // passing `authData || clientDataHash` directly never verifies.
+  // device capture in assertion.test.ts.
   const nonce = await sha256Bytes(concat(asn.authenticatorData, clientDataHash))
 
-  const verifyKey = await crypto.subtle.importKey(
-    'spki',
-    base64ToBytes(record.spki),
-    ECDSA_P256,
-    false,
-    ['verify']
-  )
-  const rawSig = derEcdsaSignatureToRaw(asn.signature)
+  let verifyKey: CryptoKey
+  try {
+    verifyKey = await crypto.subtle.importKey(
+      'spki',
+      base64ToBytes(spki),
+      ECDSA_P256,
+      false,
+      ['verify']
+    )
+  } catch (e) {
+    throw new AppAttestError('stored device key is invalid', {
+      reason: 'assertion_invalid',
+      cause: e,
+    })
+  }
+
+  let rawSig: Uint8Array
+  try {
+    rawSig = derEcdsaSignatureToRaw(asn.signature)
+  } catch (e) {
+    throw new AppAttestError(`malformed assertion signature: ${(e as Error).message}`, {
+      reason: 'assertion_invalid',
+      cause: e,
+    })
+  }
+
   const ok = await crypto.subtle.verify(
     { name: 'ECDSA', hash: 'SHA-256' },
     verifyKey,
     rawSig,
     nonce
   )
-  if (!ok) throw new AppAttestError('assertion signature invalid')
+  if (!ok) {
+    throw new AppAttestError('assertion signature invalid', {
+      reason: 'assertion_invalid',
+    })
+  }
 
-  await putKeyRecord(kv, keyId, { ...record, signCount: parsed.signCount })
+  return { signCount: parsed.signCount }
 }

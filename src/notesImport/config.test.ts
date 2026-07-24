@@ -8,7 +8,7 @@ import {
 } from './config'
 import type { Environment } from '../types'
 
-const baseEnv = {} as Environment
+const baseEnv = { APP_ATTEST_ENVIRONMENT: 'production' } as Environment
 
 const limitsKv = (value: string | null): LimitsKv => ({
   get: vi.fn(async () => value) as LimitsKv['get'],
@@ -28,20 +28,31 @@ describe('getNotesImportConfig — environment-only knobs', () => {
     expect(cfg.requireProduction).toBe(true)
   })
 
-  it('accepts development attestations only where the dev-bypass token is set', () => {
+  it('uses the explicit environment and rejects a production bypass', () => {
     expect(getNotesImportConfig(baseEnv).requireProduction).toBe(true)
     expect(
       getNotesImportConfig({
         ...baseEnv,
+        APP_ATTEST_ENVIRONMENT: 'development',
         NOTES_IMPORT_DEV_BYPASS_TOKEN: 'tok',
       } as Environment).requireProduction
     ).toBe(false)
     expect(
       getNotesImportConfig({
         ...baseEnv,
+        APP_ATTEST_ENVIRONMENT: 'development',
         NOTES_IMPORT_DEV_BYPASS_TOKEN: '   ',
       } as Environment).requireProduction
-    ).toBe(true)
+    ).toBe(false)
+    expect(() =>
+      getNotesImportConfig({
+        ...baseEnv,
+        NOTES_IMPORT_DEV_BYPASS_TOKEN: 'tok',
+      } as Environment)
+    ).toThrow('cannot be set in production')
+    expect(() =>
+      getNotesImportConfig({} as Environment)
+    ).toThrow('must be explicitly configured')
   })
 
   it('honors environment-only overrides without moving unrelated controls to KV', () => {
@@ -52,6 +63,7 @@ describe('getNotesImportConfig — environment-only knobs', () => {
       NOTES_IMPORT_MAX_CHARS: '250000',
       NOTES_IMPORT_EMPTY_WINDOW_SECONDS: '86400',
       NOTES_IMPORT_EMPTY_WINDOW_LIMIT: '3',
+      APP_ATTEST_ENVIRONMENT: 'development',
       NOTES_IMPORT_DEV_BYPASS_TOKEN: 'tok',
     } as Environment)
     expect(cfg.model).toBe('fireworks/some-model')

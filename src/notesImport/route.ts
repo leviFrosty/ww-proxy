@@ -14,11 +14,26 @@ import type { CreditDecision, CreditsSnapshot } from '../credits'
 import { runNotesImportModel } from './llm'
 import { getNotesImportStatus } from './status'
 import {
-  issueChallenge,
-  verifyAssertion,
-  verifyAttestation,
+  appAttestLifecycle,
+  appAttestProtocolVersion,
   AppAttestError,
+  NOTES_IMPORT_KICKOFF_PURPOSE,
+  NOTES_IMPORT_VERIFY_PURPOSE,
+  type AppAttestAction,
+  type AppAttestReason,
+  type AppAttestAssertionPurpose,
 } from '../appAttest'
+import { appAttestHttpCode } from '../appAttest/errors'
+import {
+  computeNotesImportRequestHash,
+  isAppAttestAssertionPurpose,
+  isAppAttestChallenge,
+  isAppAttestKeyId,
+  isAppAttestOperationId,
+  isAppAttestUuid,
+  type V2AssertionChallengeRequest,
+  type V2AssertionFinalRequest,
+} from '../appAttest/protocol'
 import { isEmptyImportResult, type NotesImportContext } from './schema'
 import { handleAdminResetRequest, isValidMeterId } from './admin'
 import {
@@ -34,12 +49,16 @@ const err = (
   error: string,
   code?: string,
   detail?: string,
-  credits?: CreditsSnapshot
+  credits?: CreditsSnapshot,
+  reason?: AppAttestReason,
+  action?: AppAttestAction
 ) => {
   const body: ErrorResponse = { error }
   if (code) body.code = code
   if (detail) body.detail = detail
   if (credits) body.credits = credits
+  if (reason) body.reason = reason
+  if (action) body.action = action
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return ctx.json(body, status as any)
 }
@@ -63,6 +82,59 @@ const errorDetail = (e: unknown): string => {
 const asString = (v: unknown): string | null =>
   typeof v === 'string' && v.length > 0 ? v : null
 
+const asRecord = (value: unknown): Record<string, unknown> | null =>
+  value != null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
+
+const appAttestBadRequest = (ctx: AppContext, message: string): Response =>
+  err(
+    ctx,
+    HTTP_STATUS.BAD_REQUEST,
+    message,
+    'bad_request',
+    undefined,
+    undefined,
+    'invalid_request',
+    'none'
+  )
+
+const appAttestFailureResponse = (
+  ctx: AppContext,
+  error: AppAttestError,
+  input: unknown
+): Response => {
+  // Stable reason only: request bodies may contain a recovery token.
+  console.warn('notes-import App Attest rejected:', error.reason)
+  if (error.reason === 'storage_unavailable') Sentry.captureException(error)
+
+  const version = appAttestProtocolVersion(input)
+  const status = version === 1 && error.status < 500 ? 401 : error.status
+  const code = appAttestHttpCode(version, error.reason)
+  return err(
+    ctx,
+    status,
+    error.message,
+    code,
+    undefined,
+    undefined,
+    error.reason,
+    error.action
+  )
+}
+
+const readOptionalJson = async (
+  ctx: AppContext
+): Promise<{ ok: true; value: unknown } | { ok: false }> => {
+  const text = await ctx.req.text()
+  if (!text.trim()) return { ok: true, value: undefined }
+  try {
+    return { ok: true, value: JSON.parse(text) as unknown }
+  } catch {
+    return { ok: false }
+  }
+}
+
 /**
  * Shape gate for the client-supplied shared account id (witness-work ADR
  * 0011). It becomes a Durable Object name, a RevenueCat app-user-id path
@@ -71,6 +143,115 @@ const asString = (v: unknown): string | null =>
  * `Crypto.randomUUID()` strings, which this accepts with room to spare.
  */
 const isValidAccountId = isValidMeterId
+
+const isLowercaseSha256 = (value: string): boolean =>
+  /^[a-f0-9]{64}$/.test(value)
+
+const parseV2AssertionChallengeRequest = (
+  record: Record<string, unknown>
+): V2AssertionChallengeRequest | null => {
+  const operationId = asString(record.operationId)
+  const uuid = asString(record.uuid)
+  const keyId = asString(record.keyId)
+  const purpose = asString(record.purpose)
+  const contentHash = asString(record.contentHash)
+  const requestHash = asString(record.requestHash)
+  const accountId =
+    record.accountId == null ? undefined : asString(record.accountId)
+  if (
+    record.protocolVersion !== 2 ||
+    record.operation !== 'assert' ||
+    !operationId ||
+    !isAppAttestOperationId(operationId) ||
+    !uuid ||
+    !isAppAttestUuid(uuid) ||
+    !keyId ||
+    !isAppAttestKeyId(keyId) ||
+    !purpose ||
+    !isAppAttestAssertionPurpose(purpose) ||
+    (record.accountId != null &&
+      (!accountId || !isValidAccountId(accountId))) ||
+    !contentHash ||
+    !isLowercaseSha256(contentHash) ||
+    !requestHash ||
+    !isLowercaseSha256(requestHash)
+  ) {
+    return null
+  }
+  return {
+    protocolVersion: 2,
+    operation: 'assert',
+    operationId,
+    uuid,
+    keyId,
+    purpose,
+    ...(accountId ? { accountId } : {}),
+    contentHash,
+    requestHash,
+  }
+}
+
+const parseV2AssertionFinalRequest = (
+  record: Record<string, unknown>,
+  expectedPurpose: AppAttestAssertionPurpose
+): V2AssertionFinalRequest | null => {
+  const challengeRequest = parseV2AssertionChallengeRequest(record)
+  const challenge = asString(record.challenge)
+  const assertion = asString(record.assertion)
+  if (
+    !challengeRequest ||
+    challengeRequest.purpose !== expectedPurpose ||
+    !challenge ||
+    !isAppAttestChallenge(challenge) ||
+    !assertion ||
+    assertion.length > 65_536
+  ) {
+    return null
+  }
+  return { ...challengeRequest, challenge, assertion }
+}
+
+const storageUnavailable = (cause: unknown): AppAttestError =>
+  new AppAttestError('App Attest storage is temporarily unavailable', {
+    reason: 'storage_unavailable',
+    action: 'retry',
+    status: 503,
+    cause,
+  })
+
+const issueV2AssertionChallenge = async (
+  ctx: AppContext,
+  request: V2AssertionChallengeRequest
+) => {
+  try {
+    const id = ctx.env.APP_ATTEST_IDENTITY.idFromName(request.uuid)
+    const result = await ctx.env.APP_ATTEST_IDENTITY.get(id).issueChallenge(
+      request
+    )
+    if (!result.ok) throw AppAttestError.fromFailure(result.error)
+    return result.value
+  } catch (error) {
+    if (error instanceof AppAttestError) throw error
+    throw storageUnavailable(error)
+  }
+}
+
+const verifyV2Assertion = async (
+  ctx: AppContext,
+  request: V2AssertionFinalRequest
+) => {
+  try {
+    const id = ctx.env.APP_ATTEST_IDENTITY.idFromName(request.uuid)
+    const result = await ctx.env.APP_ATTEST_IDENTITY.get(id).verifyAssertion(
+      request
+    )
+    if (!result.ok) throw AppAttestError.fromFailure(result.error)
+    return result.value
+  } catch (error) {
+    if (error instanceof AppAttestError) throw error
+    throw storageUnavailable(error)
+  }
+}
 
 const subKey = (token: string) => `notes-import:sub:${token}`
 
@@ -90,54 +271,73 @@ export async function handleNotesImportStatusRequest(ctx: AppContext) {
   return ctx.json(status)
 }
 
-/** POST /notes-import/challenge — issue a one-time App Attest challenge. */
+/** POST /notes-import/challenge — issue an App Attest challenge (v1 or v2). */
 export async function handleChallengeRequest(ctx: AppContext) {
-  const challenge = await issueChallenge(ctx.env.NOTES_KV)
-  return ctx.json({ challenge })
-}
-
-/** POST /notes-import/attest — initial App Attest handshake; stores the device key. */
-export async function handleAttestRequest(ctx: AppContext) {
-  let body: Record<string, unknown>
-  try {
-    body = (await ctx.req.json()) as Record<string, unknown>
-  } catch {
-    return err(ctx, HTTP_STATUS.BAD_REQUEST, 'Invalid JSON', 'bad_request')
+  const parsed = await readOptionalJson(ctx)
+  if (!parsed.ok) return appAttestBadRequest(ctx, 'Invalid JSON')
+  if (parsed.value !== undefined && !asRecord(parsed.value)) {
+    return appAttestBadRequest(ctx, 'Invalid JSON body')
+  }
+  const record = asRecord(parsed.value)
+  const isV2Assertion =
+    record?.protocolVersion === 2 && record.operation === 'assert'
+  const v2AssertionRequest = isV2Assertion
+    ? parseV2AssertionChallengeRequest(record)
+    : null
+  if (isV2Assertion && !v2AssertionRequest) {
+    return appAttestBadRequest(ctx, 'Invalid App Attest v2 assertion challenge')
   }
 
-  const keyId = asString(body.keyId)
-  const attestation = asString(body.attestation)
-  const challenge = asString(body.challenge)
-  const uuid = asString(body.uuid)
-  if (!keyId || !attestation || !challenge || !uuid) {
-    return err(
-      ctx,
-      HTTP_STATUS.BAD_REQUEST,
-      'Missing keyId, attestation, challenge, or uuid',
-      'bad_request'
-    )
-  }
-
-  const config = getNotesImportConfig(ctx.env)
   try {
-    await verifyAttestation({
-      kv: ctx.env.NOTES_KV,
-      attestation,
-      keyId,
-      challenge,
-      uuid,
-      teamId: ctx.env.APPLE_TEAM_ID,
-      bundleId: ctx.env.IOS_BUNDLE_ID,
-      // Reject dev-environment attestations on prod (dev worker still accepts
-      // them for real-device testing). Heuristic: prod has no dev-bypass token.
-      requireProduction: config.requireProduction,
-    })
+    const response = v2AssertionRequest
+      ? await issueV2AssertionChallenge(ctx, v2AssertionRequest)
+      : await appAttestLifecycle(ctx.env).issueChallenge(parsed.value)
+    return ctx.json(response)
   } catch (e) {
     if (e instanceof AppAttestError) {
-      // The message is otherwise only in the response body, which no log
-      // store captures — surface it in Workers Logs for field debugging.
-      console.warn('notes-import attest rejected:', e.message)
-      return err(ctx, HTTP_STATUS.UNAUTHORIZED, e.message, 'attestation_failed')
+      return appAttestFailureResponse(ctx, e, parsed.value)
+    }
+    Sentry.captureException(e)
+    return err(
+      ctx,
+      HTTP_STATUS.INTERNAL_SERVER_ERROR,
+      'Challenge error',
+      'server_error'
+    )
+  }
+}
+
+/** POST /notes-import/attest — bind a key or enroll v2 recovery. */
+export async function handleAttestRequest(ctx: AppContext) {
+  let parsed: unknown
+  try {
+    parsed = await ctx.req.json()
+  } catch {
+    return appAttestBadRequest(ctx, 'Invalid JSON')
+  }
+  const body = asRecord(parsed)
+  if (!body) return appAttestBadRequest(ctx, 'Invalid JSON body')
+
+  // Keep the deployed v1 request gate and top-level error text unchanged.
+  if (appAttestProtocolVersion(body) === 1) {
+    const keyId = asString(body.keyId)
+    const attestation = asString(body.attestation)
+    const challenge = asString(body.challenge)
+    const uuid = asString(body.uuid)
+    if (!keyId || !attestation || !challenge || !uuid) {
+      return appAttestBadRequest(
+        ctx,
+        'Missing keyId, attestation, challenge, or uuid'
+      )
+    }
+  }
+
+  try {
+    const response = await appAttestLifecycle(ctx.env).register(body)
+    return ctx.json(response)
+  } catch (e) {
+    if (e instanceof AppAttestError) {
+      return appAttestFailureResponse(ctx, e, body)
     }
     Sentry.captureException(e)
     return err(
@@ -147,7 +347,6 @@ export async function handleAttestRequest(ctx: AppContext) {
       'server_error'
     )
   }
-  return ctx.json({ ok: true })
 }
 
 /**
@@ -155,15 +354,45 @@ export async function handleAttestRequest(ctx: AppContext) {
  * diagnostics. Runs the exact verifyAssertion path the metered endpoints use
  * (challenge consumption and sign-count advance included) but touches no
  * credits and no inference, so the Tools screen can prove the full App Attest
- * boundary server-side. The probe `contentHash` is client-chosen; it's bound
- * into the signed clientData like any real import's hash.
+ * boundary server-side. This no-payload probe requires `requestHash` to equal
+ * its client-chosen `contentHash`; real kickoffs instead hash their canonical
+ * Notes Import payload.
  */
 export async function handleNotesImportVerifyRequest(ctx: AppContext) {
-  let body: Record<string, unknown>
+  let parsed: unknown
   try {
-    body = (await ctx.req.json()) as Record<string, unknown>
+    parsed = await ctx.req.json()
   } catch {
-    return err(ctx, HTTP_STATUS.BAD_REQUEST, 'Invalid JSON', 'bad_request')
+    return appAttestBadRequest(ctx, 'Invalid JSON')
+  }
+  const body = asRecord(parsed)
+  if (!body) return appAttestBadRequest(ctx, 'Invalid JSON body')
+
+  const config = getNotesImportConfig(ctx.env)
+  const bypassHeader = ctx.req.header('x-ww-dev-bypass') ?? ''
+  const devBypass =
+    config.devBypassToken != null &&
+    timingSafeEqual(bypassHeader, config.devBypassToken)
+  if (devBypass) {
+    const version = appAttestProtocolVersion(body)
+    if (version === 2) {
+      const operationId = asString(body.operationId)
+      const contentHash = asString(body.contentHash)
+      const requestHash = asString(body.requestHash)
+      if (
+        !operationId ||
+        !isAppAttestOperationId(operationId) ||
+        body.operation !== 'assert' ||
+        body.purpose !== NOTES_IMPORT_VERIFY_PURPOSE ||
+        !contentHash ||
+        !isLowercaseSha256(contentHash) ||
+        requestHash !== contentHash
+      ) {
+        return appAttestBadRequest(ctx, 'Invalid App Attest v2 bypass probe')
+      }
+      return ctx.json({ ok: true, protocolVersion: 2, operationId })
+    }
+    return ctx.json({ ok: true })
   }
 
   const uuid = asString(body.uuid)
@@ -172,44 +401,66 @@ export async function handleNotesImportVerifyRequest(ctx: AppContext) {
   const assertion = asString(body.assertion)
   const contentHash = asString(body.contentHash)
   if (!uuid || !keyId || !challenge || !assertion || !contentHash) {
-    return err(
+    return appAttestBadRequest(
       ctx,
-      HTTP_STATUS.BAD_REQUEST,
-      'Missing uuid, keyId, challenge, assertion, or contentHash',
-      'bad_request'
+      'Missing uuid, keyId, challenge, assertion, or contentHash'
     )
   }
   // Same shape gates as kickoff: both values end up in the `|`-delimited
   // signed clientData, so keep them to their bounded alphabets.
   const accountId = body.accountId != null ? asString(body.accountId) : null
   if (body.accountId != null && (!accountId || !isValidAccountId(accountId))) {
-    return err(ctx, HTTP_STATUS.BAD_REQUEST, 'Invalid accountId', 'bad_request')
+    return appAttestBadRequest(ctx, 'Invalid accountId')
   }
   if (!/^[a-f0-9]{64}$/.test(contentHash)) {
-    return err(ctx, HTTP_STATUS.BAD_REQUEST, 'Invalid contentHash', 'bad_request')
+    return appAttestBadRequest(ctx, 'Invalid contentHash')
+  }
+
+  const version = appAttestProtocolVersion(body)
+  let v2Request: V2AssertionFinalRequest | null = null
+  if (version === 2) {
+    const requestHash = asString(body.requestHash)
+    if (
+      !requestHash ||
+      !isLowercaseSha256(requestHash) ||
+      requestHash !== contentHash
+    ) {
+      return appAttestBadRequest(
+        ctx,
+        'requestHash must equal contentHash for App Attest verify'
+      )
+    }
+    v2Request = parseV2AssertionFinalRequest(
+      body,
+      NOTES_IMPORT_VERIFY_PURPOSE
+    )
+    if (!v2Request) {
+      return appAttestBadRequest(ctx, 'Invalid App Attest v2 verify assertion')
+    }
   }
 
   try {
-    await verifyAssertion({
-      kv: ctx.env.NOTES_KV,
-      assertion,
-      keyId,
-      challenge,
-      uuid,
-      accountId: accountId ?? undefined,
-      contentHash,
-      teamId: ctx.env.APPLE_TEAM_ID,
-      bundleId: ctx.env.IOS_BUNDLE_ID,
-    })
+    const response = v2Request
+      ? await verifyV2Assertion(ctx, v2Request)
+      : await appAttestLifecycle(ctx.env).verifyAssertion(body, {
+          uuid,
+          accountId: accountId ?? undefined,
+          contentHash,
+          purpose: NOTES_IMPORT_VERIFY_PURPOSE,
+        })
+    return ctx.json(response)
   } catch (e) {
     if (e instanceof AppAttestError) {
-      console.warn('notes-import verify rejected:', e.message)
-      return err(ctx, HTTP_STATUS.UNAUTHORIZED, e.message, 'attestation_failed')
+      return appAttestFailureResponse(ctx, e, body)
     }
     Sentry.captureException(e)
-    return err(ctx, HTTP_STATUS.INTERNAL_SERVER_ERROR, 'Verify error', 'server_error')
+    return err(
+      ctx,
+      HTTP_STATUS.INTERNAL_SERVER_ERROR,
+      'Verify error',
+      'server_error'
+    )
   }
-  return ctx.json({ ok: true })
 }
 
 interface NotesImportBody {
@@ -218,7 +469,13 @@ interface NotesImportBody {
   accountId?: string
   notesText: string
   contentHash: string
+  requestHash?: string
   context: NotesImportContext
+  /** Additive App Attest v2 assertion fields; absent on deployed v1 clients. */
+  protocolVersion?: 1 | 2
+  operation?: string
+  operationId?: string
+  purpose?: AppAttestAssertionPurpose
   keyId?: string
   challenge?: string
   assertion?: string
@@ -257,15 +514,17 @@ type GateResult = GateOk | { ok: false; response: Response }
 
 /**
  * The shared security boundary for the metered model call: parse + validate the
- * body, recompute the authoritative content hash, verify App Attest (or the
- * dev bypass), resolve supporter status, and run the credit pre-flight. Both the
- * streaming kickoff and the legacy synchronous path go through this UNCHANGED —
- * App Attest still signs exactly the content hash being parsed. Returns either a
- * ready-to-spend `GateOk` or a fully-formed error `Response`.
+ * body, recompute the authoritative content and request hashes, verify App
+ * Attest (or the dev bypass), resolve supporter status, and run the credit
+ * pre-flight. Both the streaming kickoff and legacy synchronous path use this
+ * boundary; v1 signs the content hash, while v2 also signs the canonical
+ * request hash. Returns either a ready-to-spend `GateOk` or a fully-formed
+ * error `Response`.
  */
 async function authenticateAndGate(
   ctx: AppContext,
-  config: NotesImportConfig
+  config: NotesImportConfig,
+  assertionPurpose: AppAttestAssertionPurpose | null
 ): Promise<GateResult> {
   // Kill-switch / provider-health enforcement. `GET /notes-import/status`
   // advertises this so the app can disable its entry points BEFORE attesting,
@@ -296,15 +555,28 @@ async function authenticateAndGate(
     }
   }
 
-  let body: NotesImportBody
+  let parsed: unknown
   try {
-    body = (await ctx.req.json()) as NotesImportBody
+    parsed = await ctx.req.json()
   } catch {
     return {
       ok: false,
       response: err(ctx, HTTP_STATUS.BAD_REQUEST, 'Invalid JSON', 'bad_request'),
     }
   }
+  const record = asRecord(parsed)
+  if (!record) {
+    return {
+      ok: false,
+      response: err(
+        ctx,
+        HTTP_STATUS.BAD_REQUEST,
+        'Invalid JSON body',
+        'bad_request'
+      ),
+    }
+  }
+  const body = record as unknown as NotesImportBody
 
   const uuid = asString(body.uuid)
   const notesText = typeof body.notesText === 'string' ? body.notesText : null
@@ -327,7 +599,12 @@ async function authenticateAndGate(
   if (body.accountId != null && (!accountId || !isValidAccountId(accountId))) {
     return {
       ok: false,
-      response: err(ctx, HTTP_STATUS.BAD_REQUEST, 'Invalid accountId', 'bad_request'),
+      response: err(
+        ctx,
+        HTTP_STATUS.BAD_REQUEST,
+        'Invalid accountId',
+        'bad_request'
+      ),
     }
   }
 
@@ -359,6 +636,30 @@ async function authenticateAndGate(
     }
   }
 
+  const protocolVersion = appAttestProtocolVersion(body)
+  let requestHash: string | undefined
+  if (protocolVersion === 2) {
+    requestHash = asString(body.requestHash) ?? undefined
+    const expectedRequestHash = await computeNotesImportRequestHash({
+      notesText,
+      context: body.context,
+      refinement: body.refinement ?? null,
+    })
+    if (
+      !requestHash ||
+      !isLowercaseSha256(requestHash) ||
+      requestHash !== expectedRequestHash
+    ) {
+      return {
+        ok: false,
+        response: appAttestBadRequest(
+          ctx,
+          'requestHash does not match the Notes Import payload'
+        ),
+      }
+    }
+  }
+
   // --- Request authentication (the security boundary) -------------------
   const bypassHeader = ctx.req.header('x-ww-dev-bypass') ?? ''
   const devBypass =
@@ -366,6 +667,24 @@ async function authenticateAndGate(
     timingSafeEqual(bypassHeader, config.devBypassToken)
 
   if (!devBypass) {
+    if (
+      assertionPurpose == null &&
+      appAttestProtocolVersion(body) === 2
+    ) {
+      return {
+        ok: false,
+        response: err(
+          ctx,
+          HTTP_STATUS.BAD_REQUEST,
+          'App Attest v2 is not supported on the legacy synchronous endpoint',
+          'bad_request',
+          undefined,
+          undefined,
+          'unsupported_protocol',
+          'none'
+        ),
+      }
+    }
     const keyId = asString(body.keyId)
     const challenge = asString(body.challenge)
     const assertion = asString(body.assertion)
@@ -376,36 +695,57 @@ async function authenticateAndGate(
           ctx,
           HTTP_STATUS.UNAUTHORIZED,
           'Missing App Attest credentials',
-          'attestation_required'
+          'attestation_required',
+          undefined,
+          undefined,
+          'invalid_request',
+          'bind'
+        ),
+      }
+    }
+    const v2Request =
+      protocolVersion === 2
+        ? parseV2AssertionFinalRequest(
+            record,
+            assertionPurpose ?? NOTES_IMPORT_KICKOFF_PURPOSE
+          )
+        : null
+    if (protocolVersion === 2 && !v2Request) {
+      return {
+        ok: false,
+        response: appAttestBadRequest(
+          ctx,
+          'Invalid App Attest v2 protected assertion'
         ),
       }
     }
     try {
-      await verifyAssertion({
-        kv: ctx.env.NOTES_KV,
-        assertion,
-        keyId,
-        challenge,
-        uuid,
-        accountId: accountId ?? undefined,
-        contentHash,
-        teamId: ctx.env.APPLE_TEAM_ID,
-        bundleId: ctx.env.IOS_BUNDLE_ID,
-      })
+      if (v2Request) {
+        await verifyV2Assertion(ctx, v2Request)
+      } else {
+        await appAttestLifecycle(ctx.env).verifyAssertion(body, {
+          uuid,
+          accountId: accountId ?? undefined,
+          contentHash,
+          purpose: assertionPurpose ?? NOTES_IMPORT_KICKOFF_PURPOSE,
+        })
+      }
     } catch (e) {
       if (e instanceof AppAttestError) {
-        // The message is otherwise only in the response body, which no log
-        // store captures — surface it in Workers Logs for field debugging.
-        console.warn('notes-import assertion rejected:', e.message)
         return {
           ok: false,
-          response: err(ctx, HTTP_STATUS.UNAUTHORIZED, e.message, 'attestation_failed'),
+          response: appAttestFailureResponse(ctx, e, body),
         }
       }
       Sentry.captureException(e)
       return {
         ok: false,
-        response: err(ctx, HTTP_STATUS.INTERNAL_SERVER_ERROR, 'Auth error', 'server_error'),
+        response: err(
+          ctx,
+          HTTP_STATUS.INTERNAL_SERVER_ERROR,
+          'Auth error',
+          'server_error'
+        ),
       }
     }
   }
@@ -507,7 +847,11 @@ const deriveImportId = async (
  */
 export async function handleNotesImportKickoffRequest(ctx: AppContext) {
   const config = getNotesImportConfig(ctx.env)
-  const gate = await authenticateAndGate(ctx, config)
+  const gate = await authenticateAndGate(
+    ctx,
+    config,
+    NOTES_IMPORT_KICKOFF_PURPOSE
+  )
   if (!gate.ok) return gate.response
   const {
     meterId,
@@ -729,7 +1073,7 @@ export function handleNotesImportAdminResetRequest(ctx: AppContext) {
  */
 export async function handleNotesImportRequest(ctx: AppContext) {
   const config = getNotesImportConfig(ctx.env)
-  const gate = await authenticateAndGate(ctx, config)
+  const gate = await authenticateAndGate(ctx, config, null)
   if (!gate.ok) return gate.response
   const {
     meterId,

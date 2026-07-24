@@ -28,6 +28,7 @@ import { Sentry, createSentryConfig } from "./sentry";
 // can bind them (see wrangler.toml [[durable_objects.bindings]] + migrations).
 export { NotesImportRun } from "./notesImport/runDO";
 export { NotesImportIndex } from "./notesImport/indexDO";
+export { AppAttestIdentity } from "./appAttest/identityDO";
 
 const app = new Hono<{ Bindings: Environment }>();
 

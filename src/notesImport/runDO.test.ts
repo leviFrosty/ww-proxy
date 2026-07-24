@@ -137,6 +137,7 @@ const makeRun = async (recordUsage: ReturnType<typeof vi.fn>) => {
     release: vi.fn(async () => undefined),
   }
   const env = {
+    APP_ATTEST_ENVIRONMENT: 'production',
     OPENROUTER_API_KEY: 'openrouter-key',
     REVENUECAT_API_KEY: 'revenuecat-key',
     NOTES_KV: { get: vi.fn(async () => null) },

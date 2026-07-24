@@ -25,6 +25,19 @@ export const issueChallenge = async (
   return challenge
 }
 
+export const hasChallenge = async (
+  kv: ChallengeKv,
+  challenge: string
+): Promise<boolean> => {
+  if (!challenge) return false
+  return (await kv.get(`${CHALLENGE_PREFIX}${challenge}`)) != null
+}
+
+export const deleteChallenge = (
+  kv: ChallengeKv,
+  challenge: string
+): Promise<void> => kv.delete(`${CHALLENGE_PREFIX}${challenge}`)
+
 /**
  * Returns true iff the challenge was issued and unused, deleting it so it can't
  * be reused. False for an unknown/expired/already-consumed challenge.

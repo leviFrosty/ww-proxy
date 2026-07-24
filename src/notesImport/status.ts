@@ -4,6 +4,7 @@ import {
   type NotesImportLimits,
 } from './config'
 import type { Environment } from '../types'
+import { APP_ATTEST_PROTOCOL_VERSION } from '../appAttest/protocol'
 
 /** The KV subset this module uses — keeps it trivially mockable in tests. */
 export type StatusKv = Pick<KVNamespace, 'get' | 'put'>
@@ -49,9 +50,23 @@ export interface PublicNotesImportLimits {
  * provider-probe error deliberately omits it so clients can attempt an import
  * without presenting allowance claims that the probe did not confirm.
  */
-export type NotesImportStatusResponse =
+type NotesImportStatusState =
   | { available: true; limits?: PublicNotesImportLimits }
   | { available: false; reason?: string }
+
+export interface NotesImportCapabilities {
+  appAttest: {
+    protocolVersions: readonly [1, typeof APP_ATTEST_PROTOCOL_VERSION]
+  }
+}
+
+export type NotesImportStatusResponse = NotesImportStatusState & {
+  capabilities: NotesImportCapabilities
+}
+
+const NOTES_IMPORT_CAPABILITIES: NotesImportCapabilities = {
+  appAttest: { protocolVersions: [1, APP_ATTEST_PROTOCOL_VERSION] },
+}
 
 const ENABLED_KEY = 'notes-import:enabled'
 const PROVIDER_CACHE_KEY = 'notes-import:provider-health'
@@ -201,15 +216,15 @@ const publicSchedule = (limits: NotesImportLimits): PublicNotesImportLimits => {
   }
 }
 
-export const getNotesImportStatus = async ({
+const resolveNotesImportStatus = async ({
   kv,
   env,
   apiKey,
   config,
   includeLimits = true,
   fetchFn = fetch,
-}: NotesImportStatusDeps): Promise<NotesImportStatusResponse> => {
-  const availableWithSchedule = async (): Promise<NotesImportStatusResponse> =>
+}: NotesImportStatusDeps): Promise<NotesImportStatusState> => {
+  const availableWithSchedule = async (): Promise<NotesImportStatusState> =>
     includeLimits
       ? {
           available: true,
@@ -260,3 +275,10 @@ export const getNotesImportStatus = async ({
     ? availableWithSchedule()
     : { available: false, reason: 'no_provider' }
 }
+
+export const getNotesImportStatus = async (
+  dependencies: NotesImportStatusDeps
+): Promise<NotesImportStatusResponse> => ({
+  ...(await resolveNotesImportStatus(dependencies)),
+  capabilities: NOTES_IMPORT_CAPABILITIES,
+})

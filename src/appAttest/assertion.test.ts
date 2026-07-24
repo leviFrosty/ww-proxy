@@ -1,16 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { encode } from 'cbor2'
-import { verifyAssertion } from './assert'
+import { verifyAssertionCryptography } from './assert'
 import { AppAttestError } from './errors'
-import { issueChallenge, type ChallengeKv } from './challenge'
 import { appIdRpHash } from './appId'
 import { buildAssertionClientData } from './clientData'
 import { base64ToBytes, bytesToBase64Url, sha256Bytes } from '../crypto'
-import { makeMemoryKv } from '../test/memoryKv'
 
 const TEAM = 'ABCDE12345'
 const BUNDLE = 'com.example.app'
-const KEY_ID = 'test-key-id'
 
 const concat = (a: Uint8Array, b: Uint8Array) => {
   const out = new Uint8Array(a.length + b.length)
@@ -37,26 +34,16 @@ const rawEcdsaToDer = (raw: Uint8Array): Uint8Array => {
 }
 
 const setup = async () => {
-  const kv = makeMemoryKv()
   const pair = await crypto.subtle.generateKey(
     { name: 'ECDSA', namedCurve: 'P-256' },
     true,
     ['sign', 'verify']
   )
-  const spki = new Uint8Array(
-    (await crypto.subtle.exportKey('spki', pair.publicKey)) as ArrayBuffer
-  )
-  const storeKey = async (uuid: string, signCount = 0) =>
-    kv.put(
-      `key:${KEY_ID}`,
-      JSON.stringify({
-        spki: bytesToBase64Url(spki),
-        signCount,
-        uuid,
-        environment: 'development',
-        attestedAt: 0,
-      })
+  const spki = bytesToBase64Url(
+    new Uint8Array(
+      (await crypto.subtle.exportKey('spki', pair.publicKey)) as ArrayBuffer
     )
+  )
 
   const buildAuthData = async (signCount: number, flags = 0) => {
     const rp = await appIdRpHash(TEAM, BUNDLE)
@@ -68,28 +55,14 @@ const setup = async () => {
   }
 
   const makeAssertion = async (opts: {
-    uuid: string
-    contentHash: string
-    challenge: string
+    clientData: string
     signCount: number
-    /** Shared account id folded into the signed client data, when present. */
-    accountId?: string
-    /** Sign over a DIFFERENT content hash than the one we'll verify against. */
-    signContentHash?: string
-    /** authData flags byte — real devices set the AT bit (0x40). */
     flags?: number
   }) => {
     const authData = await buildAuthData(opts.signCount, opts.flags ?? 0)
-    const clientData = buildAssertionClientData({
-      challenge: opts.challenge,
-      uuid: opts.uuid,
-      accountId: opts.accountId,
-      contentHash: opts.signContentHash ?? opts.contentHash,
-    })
-    const clientDataHash = await sha256Bytes(new TextEncoder().encode(clientData))
-    // Apple signs the nonce itself (digest = SHA256(nonce)), not the
-    // authData||clientDataHash message — mirror that here so these synthetic
-    // assertions exercise the same scheme real devices use.
+    const clientDataHash = await sha256Bytes(
+      new TextEncoder().encode(opts.clientData)
+    )
     const nonce = await sha256Bytes(concat(authData, clientDataHash))
     const rawSig = new Uint8Array(
       await crypto.subtle.sign(
@@ -98,241 +71,114 @@ const setup = async () => {
         nonce
       )
     )
-    const cbor = encode({
-      signature: rawEcdsaToDer(rawSig),
-      authenticatorData: authData,
-    })
-    return bytesToBase64Url(cbor)
+    return bytesToBase64Url(
+      encode({
+        signature: rawEcdsaToDer(rawSig),
+        authenticatorData: authData,
+      })
+    )
   }
 
-  const verify = (
-    assertion: string,
-    challenge: string,
-    uuid = 'uuid-1',
-    contentHash = 'hash-1',
-    accountId?: string
-  ) =>
-    verifyAssertion({
-      kv: kv as unknown as ChallengeKv,
+  const verify = (assertion: string, clientData: string) =>
+    verifyAssertionCryptography({
       assertion,
-      keyId: KEY_ID,
-      challenge,
-      uuid,
-      accountId,
-      contentHash,
+      spki,
+      clientData,
       teamId: TEAM,
       bundleId: BUNDLE,
     })
 
-  return { kv, storeKey, makeAssertion, verify }
+  return { makeAssertion, verify }
 }
 
-describe('verifyAssertion (end-to-end with a synthetic Secure-Enclave key)', () => {
-  it('accepts a well-formed, freshly-challenged assertion', async () => {
-    const { kv, storeKey, makeAssertion, verify } = await setup()
-    await storeKey('uuid-1')
-    const challenge = await issueChallenge(kv as unknown as ChallengeKv)
-    const assertion = await makeAssertion({
-      uuid: 'uuid-1',
-      contentHash: 'hash-1',
-      challenge,
-      signCount: 1,
-    })
-    await expect(verify(assertion, challenge)).resolves.toBeUndefined()
-    // Sign-count advanced in the stored record.
-    expect(JSON.parse(kv.store.get(`key:${KEY_ID}`)!).signCount).toBe(1)
+const v1ClientData = (overrides: Partial<{
+  challenge: string
+  uuid: string
+  accountId: string
+  contentHash: string
+}> = {}) =>
+  buildAssertionClientData({
+    challenge: overrides.challenge ?? 'challenge-1',
+    uuid: overrides.uuid ?? 'uuid-1',
+    accountId: overrides.accountId,
+    contentHash: overrides.contentHash ?? 'hash-1',
   })
 
-  it('accepts a real-device assertion with the AT flag set on 37-byte authData', async () => {
-    const { kv, storeKey, makeAssertion, verify } = await setup()
-    await storeKey('uuid-1')
-    const challenge = await issueChallenge(kv as unknown as ChallengeKv)
+describe('verifyAssertionCryptography', () => {
+  it('accepts a valid assertion and returns its counter without storing policy state', async () => {
+    const { makeAssertion, verify } = await setup()
+    const clientData = v1ClientData()
+    const assertion = await makeAssertion({ clientData, signCount: 7 })
+
+    await expect(verify(assertion, clientData)).resolves.toEqual({ signCount: 7 })
+  })
+
+  it('accepts real-device 37-byte authenticator data with the AT flag set', async () => {
+    const { makeAssertion, verify } = await setup()
+    const clientData = v1ClientData()
     const assertion = await makeAssertion({
-      uuid: 'uuid-1',
-      contentHash: 'hash-1',
-      challenge,
+      clientData,
       signCount: 1,
       flags: 0x40,
     })
-    await expect(verify(assertion, challenge)).resolves.toBeUndefined()
+
+    await expect(verify(assertion, clientData)).resolves.toEqual({ signCount: 1 })
   })
 
-  it('rejects a malformed assertion with an AppAttestError (not a 500-class throw)', async () => {
-    const { kv, storeKey, verify } = await setup()
-    await storeKey('uuid-1')
-    const challenge = await issueChallenge(kv as unknown as ChallengeKv)
-    // Valid CBOR envelope, but authenticatorData is too short to parse.
-    const cbor = encode({
-      signature: new Uint8Array([1, 2, 3]),
-      authenticatorData: new Uint8Array(10),
-    })
-    await expect(
-      verify(bytesToBase64Url(cbor), challenge)
-    ).rejects.toThrow(AppAttestError)
-  })
+  it('reports malformed assertions as AppAttestError', async () => {
+    const { verify } = await setup()
+    const malformed = bytesToBase64Url(
+      encode({
+        signature: new Uint8Array([1, 2, 3]),
+        authenticatorData: new Uint8Array(10),
+      })
+    )
 
-  it('rejects a replayed challenge (one-time use)', async () => {
-    const { kv, storeKey, makeAssertion, verify } = await setup()
-    await storeKey('uuid-1')
-    const challenge = await issueChallenge(kv as unknown as ChallengeKv)
-    const assertion = await makeAssertion({
-      uuid: 'uuid-1',
-      contentHash: 'hash-1',
-      challenge,
-      signCount: 1,
-    })
-    await verify(assertion, challenge)
-    await expect(verify(assertion, challenge)).rejects.toBeInstanceOf(
+    await expect(verify(malformed, v1ClientData())).rejects.toBeInstanceOf(
       AppAttestError
     )
   })
 
-  it('rejects a tampered content hash (signature no longer covers it)', async () => {
-    const { kv, storeKey, makeAssertion, verify } = await setup()
-    await storeKey('uuid-1')
-    const challenge = await issueChallenge(kv as unknown as ChallengeKv)
-    const assertion = await makeAssertion({
-      uuid: 'uuid-1',
-      contentHash: 'hash-1',
-      challenge,
-      signCount: 1,
-      signContentHash: 'a-different-hash',
-    })
-    await expect(verify(assertion, challenge, 'uuid-1', 'hash-1')).rejects.toThrow(
-      'assertion signature invalid'
-    )
-  })
+  it('rejects client data changed after signing', async () => {
+    const { makeAssertion, verify } = await setup()
+    const signed = v1ClientData({ contentHash: 'signed-hash' })
+    const assertion = await makeAssertion({ clientData: signed, signCount: 1 })
 
-  it('rejects a non-increasing sign-count (assertion replay)', async () => {
-    const { kv, storeKey, makeAssertion, verify } = await setup()
-    await storeKey('uuid-1', 5) // stored count already at 5
-    const challenge = await issueChallenge(kv as unknown as ChallengeKv)
-    const assertion = await makeAssertion({
-      uuid: 'uuid-1',
-      contentHash: 'hash-1',
-      challenge,
-      signCount: 5,
-    })
-    await expect(verify(assertion, challenge)).rejects.toThrow(/sign-count/)
-  })
-
-  it('rejects an assertion for a key bound to a different identity', async () => {
-    const { kv, storeKey, makeAssertion, verify } = await setup()
-    await storeKey('uuid-1')
-    const challenge = await issueChallenge(kv as unknown as ChallengeKv)
-    const assertion = await makeAssertion({
-      uuid: 'uuid-2',
-      contentHash: 'hash-1',
-      challenge,
-      signCount: 1,
-    })
     await expect(
-      verify(assertion, challenge, 'uuid-2')
-    ).rejects.toThrow(/not bound/)
-  })
-
-  it('accepts an assertion binding a shared account id (four-field clientData)', async () => {
-    const { kv, storeKey, makeAssertion, verify } = await setup()
-    await storeKey('uuid-1')
-    const challenge = await issueChallenge(kv as unknown as ChallengeKv)
-    const assertion = await makeAssertion({
-      uuid: 'uuid-1',
-      contentHash: 'hash-1',
-      challenge,
-      signCount: 1,
-      accountId: 'account-1',
-    })
-    await expect(
-      verify(assertion, challenge, 'uuid-1', 'hash-1', 'account-1')
-    ).resolves.toBeUndefined()
-  })
-
-  it('rejects an assertion whose signed account id differs from the request', async () => {
-    const { kv, storeKey, makeAssertion, verify } = await setup()
-    await storeKey('uuid-1')
-    const challenge = await issueChallenge(kv as unknown as ChallengeKv)
-    const assertion = await makeAssertion({
-      uuid: 'uuid-1',
-      contentHash: 'hash-1',
-      challenge,
-      signCount: 1,
-      accountId: 'account-1',
-    })
-    // A proxying user swapping in someone else's account id post-signature.
-    await expect(
-      verify(assertion, challenge, 'uuid-1', 'hash-1', 'account-2')
+      verify(assertion, v1ClientData({ contentHash: 'different-hash' }))
     ).rejects.toThrow('assertion signature invalid')
   })
 
-  it('rejects an account id the client never signed (old three-field signature)', async () => {
-    const { kv, storeKey, makeAssertion, verify } = await setup()
-    await storeKey('uuid-1')
-    const challenge = await issueChallenge(kv as unknown as ChallengeKv)
-    const assertion = await makeAssertion({
-      uuid: 'uuid-1',
-      contentHash: 'hash-1',
-      challenge,
-      signCount: 1,
-    })
-    await expect(
-      verify(assertion, challenge, 'uuid-1', 'hash-1', 'account-1')
-    ).rejects.toThrow('assertion signature invalid')
-  })
+  it('binds an optional account id into the signed data', async () => {
+    const { makeAssertion, verify } = await setup()
+    const signed = v1ClientData({ accountId: 'account-1' })
+    const assertion = await makeAssertion({ clientData: signed, signCount: 1 })
 
-  it('rejects an unknown device key', async () => {
-    const { kv, makeAssertion, verify } = await setup()
-    const challenge = await issueChallenge(kv as unknown as ChallengeKv)
-    const assertion = await makeAssertion({
-      uuid: 'uuid-1',
-      contentHash: 'hash-1',
-      challenge,
-      signCount: 1,
-    })
-    await expect(verify(assertion, challenge)).rejects.toThrow(/unknown device key/)
+    await expect(verify(assertion, signed)).resolves.toEqual({ signCount: 1 })
+    await expect(
+      verify(assertion, v1ClientData({ accountId: 'account-2' }))
+    ).rejects.toThrow('assertion signature invalid')
   })
 })
 
-describe('verifyAssertion (captured real-device fixture)', () => {
-  // Captured from prod Workers Logs on 2026-07-03 while diagnosing why real
-  // assertions never verified (Levi's own device; the challenge is long
-  // consumed, the key is public). Synthetic fixtures can't catch a wrong
-  // to-be-signed message — the test signer produces whatever the verifier
-  // expects — so this pins the verifier to what Secure Enclave hardware
-  // actually signs: the ECDSA digest is SHA256(nonce), nonce =
-  // SHA256(authData || clientDataHash).
+describe('verifyAssertionCryptography (captured real-device fixture)', () => {
+  // Levi's public key/assertion capture pins the to-be-signed message to actual
+  // Secure Enclave behavior rather than to the synthetic signer above.
   const FIXTURE = {
     teamId: 'Y3KE7B7AHJ',
     bundleId: 'com.leviwilkerson.jwtime',
-    keyId: 'sVDPRuerjbV83x+vholYh+EwttQgP9BlbLyeZhgI+8k=',
     uuid: '65A8B00C-DA7A-4E0A-BA5C-8E3D1B8C5F1C',
     accountId: '65A8B00C-DA7A-4E0A-BA5C-8E3D1B8C5F1C',
     challenge: 'Ofu3bubTCTXH-xVXg8DOfaBha2KXq9kx4q7n61fvjiE',
     contentHash:
       '2cd3ff6962f569cd7b328f7c7fae72ce36e6fedd5f2fd1e172c73b4156c77184',
     spki: 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAELY66tAKMMvuOymEnOhvE6rspbpTBUOJL46iDxYK8w5A1MTJGEZSIHoI5xgRi7l33TjfYP69-2QxYLp7C45ajcQ',
-    /** 37 bytes, AT flag (0x40) set, signCount 26 — the real-device shape. */
     authenticatorData: 'GGeAsV7N4dOwSQdAhz2pQI2VH8icOWVMZ4l-wJbm9gtAAAAAGg',
     signatureDer:
       'MEUCIQCL_IvSSGA3ffEKmsu0XE4ET5HVWzS1aO9cC4Pmc-cb8AIgEmYBgoJOkZVqcRSMDyDnlTEBe0-0-YtznMLEPUhOwYQ',
   }
 
-  const seededKv = async () => {
-    const kv = makeMemoryKv()
-    await kv.put(
-      `key:${FIXTURE.keyId}`,
-      JSON.stringify({
-        spki: FIXTURE.spki,
-        signCount: 0,
-        uuid: FIXTURE.uuid,
-        environment: 'production',
-        attestedAt: 0,
-      })
-    )
-    await kv.put(`chal:${FIXTURE.challenge}`, '1')
-    return kv
-  }
-
-  const fixtureAssertion = () =>
+  const assertion = () =>
     bytesToBase64Url(
       encode({
         signature: base64ToBytes(FIXTURE.signatureDer),
@@ -340,35 +186,32 @@ describe('verifyAssertion (captured real-device fixture)', () => {
       })
     )
 
-  it('verifies a captured real-device assertion and advances the sign count', async () => {
-    const kv = await seededKv()
+  const clientData = (contentHash = FIXTURE.contentHash) =>
+    buildAssertionClientData({
+      challenge: FIXTURE.challenge,
+      uuid: FIXTURE.uuid,
+      accountId: FIXTURE.accountId,
+      contentHash,
+    })
+
+  it('verifies the capture and returns its hardware counter', async () => {
     await expect(
-      verifyAssertion({
-        kv: kv as unknown as ChallengeKv,
-        assertion: fixtureAssertion(),
-        keyId: FIXTURE.keyId,
-        challenge: FIXTURE.challenge,
-        uuid: FIXTURE.uuid,
-        accountId: FIXTURE.accountId,
-        contentHash: FIXTURE.contentHash,
+      verifyAssertionCryptography({
+        assertion: assertion(),
+        spki: FIXTURE.spki,
+        clientData: clientData(),
         teamId: FIXTURE.teamId,
         bundleId: FIXTURE.bundleId,
       })
-    ).resolves.toBeUndefined()
-    expect(JSON.parse(kv.store.get(`key:${FIXTURE.keyId}`)!).signCount).toBe(26)
+    ).resolves.toEqual({ signCount: 26 })
   })
 
-  it('rejects the same capture when any signed field changes', async () => {
-    const kv = await seededKv()
+  it('rejects the capture when a signed field changes', async () => {
     await expect(
-      verifyAssertion({
-        kv: kv as unknown as ChallengeKv,
-        assertion: fixtureAssertion(),
-        keyId: FIXTURE.keyId,
-        challenge: FIXTURE.challenge,
-        uuid: FIXTURE.uuid,
-        accountId: FIXTURE.accountId,
-        contentHash: FIXTURE.contentHash.replace(/2/g, '3'),
+      verifyAssertionCryptography({
+        assertion: assertion(),
+        spki: FIXTURE.spki,
+        clientData: clientData(FIXTURE.contentHash.replace(/2/g, '3')),
         teamId: FIXTURE.teamId,
         bundleId: FIXTURE.bundleId,
       })

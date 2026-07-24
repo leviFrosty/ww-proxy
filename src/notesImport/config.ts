@@ -42,15 +42,7 @@ export interface NotesImportConfig {
   emptyWindowLimit: number
   entitlementId: string
   devBypassToken: string | null
-  /**
-   * Reject development-environment (`appattestdevelop`) App Attest attestations,
-   * per Apple's guidance to accept only production attestations in production.
-   * There's no explicit prod/dev flag in the env, so this is DERIVED from the
-   * dev-bypass token: only the dev/staging worker sets `NOTES_IMPORT_DEV_BYPASS_TOKEN`
-   * (never prod — see CLAUDE.md), so `devBypassToken == null` ⇒ this is prod ⇒
-   * require production attestations. The dev worker (bypass set) also accepts
-   * development attestations so a real device can be tested against it.
-   */
+  /** Reject development App Attest attestations in the production Worker. */
   requireProduction: boolean
   /** Max concurrent in-flight imports per identity (non-Supporter). */
   activeImportCap: number
@@ -319,6 +311,24 @@ export const limitsWindowDurationMs = (limits: NotesImportLimits): number => {
   return duration
 }
 
+const appAttestConfig = (
+  env: Environment
+): Pick<NotesImportConfig, 'devBypassToken' | 'requireProduction'> => {
+  const token = env.NOTES_IMPORT_DEV_BYPASS_TOKEN?.trim() || null
+  if (env.APP_ATTEST_ENVIRONMENT === 'production') {
+    if (token) {
+      throw new Error(
+        'NOTES_IMPORT_DEV_BYPASS_TOKEN cannot be set in production'
+      )
+    }
+    return { devBypassToken: null, requireProduction: true }
+  }
+  if (env.APP_ATTEST_ENVIRONMENT === 'development') {
+    return { devBypassToken: token, requireProduction: false }
+  }
+  throw new Error('APP_ATTEST_ENVIRONMENT must be explicitly configured')
+}
+
 export const getNotesImportConfig = (env: Environment): NotesImportConfig => ({
   model: env.NOTES_IMPORT_MODEL?.trim() || DEFAULTS.model,
   providers: listOr(env.NOTES_IMPORT_PROVIDERS, DEFAULTS.providers),
@@ -337,12 +347,7 @@ export const getNotesImportConfig = (env: Environment): NotesImportConfig => ({
   ),
   entitlementId:
     env.REVENUECAT_ENTITLEMENT_ID?.trim() || DEFAULTS.entitlementId,
-  devBypassToken: env.NOTES_IMPORT_DEV_BYPASS_TOKEN?.trim() || null,
-  // Require production attestations wherever there's no dev-bypass token, i.e.
-  // on prod. (An explicit env override would be nice but is deliberately omitted
-  // to keep this change off the shared `Environment` type; the heuristic is
-  // self-consistent with how the dev worker is provisioned.)
-  requireProduction: !env.NOTES_IMPORT_DEV_BYPASS_TOKEN?.trim(),
+  ...appAttestConfig(env),
   activeImportCap: intOr(env.NOTES_IMPORT_ACTIVE_CAP, DEFAULTS.activeImportCap),
   activeImportCapSupporter: intOr(
     env.NOTES_IMPORT_ACTIVE_CAP_SUPPORTER,

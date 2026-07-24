@@ -46,6 +46,8 @@ routes = []
 binding = "CF_VERSION_METADATA"
 
 [env.dev.vars]
+# Explicitly permits development App Attest receipts and the simulator bypass.
+APP_ATTEST_ENVIRONMENT = "development"
 # Dev iOS bundle id (witness-work app.config.ts IS_DEV branch).
 IOS_BUNDLE_ID = "com.leviwilkerson.jwtimedev"
 REVENUECAT_ENTITLEMENT_ID = "Supporter"
@@ -58,7 +60,7 @@ NOTES_IMPORT_MAX_REFINEMENTS = "5"
 NOTES_IMPORT_MAX_REFINEMENTS_SUPPORTER = "-1"
 NOTES_IMPORT_WINDOW_DAYS = "30"
 
-# Separate KV so dev never shares prod's runtime policy / device keys.
+# Separate KV so dev never shares prod runtime policy or App Attest v1 mirrors.
 # Create with: wrangler kv namespace create NOTES_KV --env dev
 # then paste the printed id below.
 [[env.dev.kv_namespaces]]
@@ -75,9 +77,17 @@ class_name = "NotesImportRun"
 name = "NOTES_IMPORT_INDEX"
 class_name = "NotesImportIndex"
 
+[[env.dev.durable_objects.bindings]]
+name = "APP_ATTEST_IDENTITY"
+class_name = "AppAttestIdentity"
+
 [[env.dev.migrations]]
 tag = "v1"
 new_sqlite_classes = ["NotesImportRun", "NotesImportIndex"]
+
+[[env.dev.migrations]]
+tag = "v2"
+new_sqlite_classes = ["AppAttestIdentity"]
 
 [[env.dev.ratelimits]]
 name = "RATE_LIMITER"
@@ -102,6 +112,8 @@ head_sampling_rate = 1
   head_sampling_rate = 1
 
 [vars]
+# Explicit production invariant: development attestations and bypasses fail closed.
+APP_ATTEST_ENVIRONMENT = "production"
 # iOS bundle id — part of the App Attest app id (`<APPLE_TEAM_ID>.<IOS_BUNDLE_ID>`).
 IOS_BUNDLE_ID = "com.leviwilkerson.jwtime"
 # RevenueCat entitlement that denotes a Supporter (server-side check).
@@ -119,8 +131,9 @@ NOTES_IMPORT_MAX_REFINEMENTS = "5"
 NOTES_IMPORT_MAX_REFINEMENTS_SUPPORTER = "-1"
 NOTES_IMPORT_WINDOW_DAYS = "30"
 
-# Notes Import metadata store (challenges, device keys, runtime policy, and
-# short-lived capabilities). Usage lives in NOTES_IMPORT_INDEX. Holds NO notes
+# Notes Import metadata store (legacy App Attest compatibility state, runtime
+# policy, and short-lived capabilities). Authoritative App Attest identity state
+# lives in APP_ATTEST_IDENTITY. Usage lives in NOTES_IMPORT_INDEX. Holds NO notes
 # text or model output (ADR 0008). Create with:
 #   wrangler kv namespace create NOTES_KV
 # then paste the printed id below.
@@ -163,9 +176,19 @@ class_name = "NotesImportRun"
 name = "NOTES_IMPORT_INDEX"
 class_name = "NotesImportIndex"
 
+[[durable_objects.bindings]]
+name = "APP_ATTEST_IDENTITY"
+class_name = "AppAttestIdentity"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["NotesImportRun", "NotesImportIndex"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["AppAttestIdentity"]
+# AppAttestIdentity becomes authoritative at this cutover. Never roll production
+# back to a pre-v2/KV-authoritative Worker; ship a forward fix instead.
 
 [observability]
 enabled = true

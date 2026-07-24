@@ -6,14 +6,7 @@ import { APPLE_APP_ATTEST_ROOT_CA_PEM } from './appleRootCa'
 import { decodeAttestation, parseAuthData } from './decode'
 import { extractAttestationNonce } from './der'
 import { appIdRpHash, bytesEqual } from './appId'
-import { consumeChallenge } from './challenge'
 import { AppAttestError } from './errors'
-import {
-  getUuidOwner,
-  putKeyRecord,
-  putUuidOwner,
-  type AppAttestKv,
-} from './keyStore'
 
 // @peculiar/x509 needs a WebCrypto implementation; the Workers global works.
 cryptoProvider.set(crypto as Crypto)
@@ -36,60 +29,58 @@ const decodeEnvironment = (
   return text.startsWith('appattestdevelop') ? 'development' : 'production'
 }
 
-export interface VerifyAttestationArgs {
-  kv: AppAttestKv
+export interface VerifyAttestationCryptographyArgs {
   /** Base64 of the CBOR attestation object from `DCAppAttestService.attestKey`. */
   attestation: string
-  /** The key identifier (base64) returned by `generateKey`. */
+  /** The key identifier returned by `generateKey`. */
   keyId: string
-  /** The challenge string this device was issued (consumed here). */
-  challenge: string
-  /** Keychain UUID to pin this device key to. */
-  uuid: string
+  /** Exact domain-separated client data whose SHA-256 was passed to `attestKey`. */
+  clientData: string
   teamId: string
   bundleId: string
-  /** When true, reject development-environment ('appattestdevelop') attestations. */
+  /** When true, reject development-environment (`appattestdevelop`) attestations. */
   requireProduction?: boolean
 }
 
-/**
- * Verifies an App Attest attestation per Apple's spec and, on success, stores
- * the device's public key (pinned to `uuid`) so future assertions can be
- * checked. Throws {@link AppAttestError} on any failure. This is the one-time
- * handshake path; the per-request path is {@link verifyAssertion}.
- */
-export const verifyAttestation = async ({
-  kv,
+export interface VerifiedAttestation {
+  /** Base64url SPKI of the attested P-256 public key. */
+  spki: string
+  environment: 'development' | 'production'
+}
+
+const verify = async ({
   attestation,
   keyId,
-  challenge,
-  uuid,
+  clientData,
   teamId,
   bundleId,
   requireProduction = false,
-}: VerifyAttestationArgs): Promise<void> => {
-  if (!(await consumeChallenge(kv, challenge))) {
-    throw new AppAttestError('challenge invalid or expired')
-  }
-
+}: VerifyAttestationCryptographyArgs): Promise<VerifiedAttestation> => {
   let att
   try {
     att = decodeAttestation(base64ToBytes(attestation))
   } catch (e) {
-    throw new AppAttestError(`malformed attestation: ${(e as Error).message}`)
+    throw new AppAttestError(`malformed attestation: ${(e as Error).message}`, {
+      reason: 'attestation_invalid',
+      cause: e,
+    })
   }
   if (att.fmt !== 'apple-appattest') {
-    throw new AppAttestError(`unexpected attestation format: ${att.fmt}`)
+    throw new AppAttestError(`unexpected attestation format: ${att.fmt}`, {
+      reason: 'attestation_invalid',
+    })
   }
   if (att.attStmt.x5c.length < 2) {
-    throw new AppAttestError('attestation chain too short')
+    throw new AppAttestError('attestation chain too short', {
+      reason: 'attestation_invalid',
+    })
   }
 
-  // 1. clientDataHash = SHA256(challenge); nonce = SHA256(authData || clientDataHash).
-  const clientDataHash = await sha256Bytes(new TextEncoder().encode(challenge))
+  // 1. clientDataHash = SHA256(clientData); nonce = SHA256(authData || hash).
+  const clientDataHash = await sha256Bytes(new TextEncoder().encode(clientData))
   const nonce = await sha256Bytes(concat(att.authData, clientDataHash))
 
-  // 2. Validate the certificate chain leaf → intermediate → Apple root.
+  // 2. Validate the certificate chain leaf → intermediate → pinned Apple root.
   const leaf = new X509Certificate(att.attStmt.x5c[0])
   const intermediate = new X509Certificate(att.attStmt.x5c[1])
   const root = new X509Certificate(APPLE_APP_ATTEST_ROOT_CA_PEM)
@@ -97,15 +88,23 @@ export const verifyAttestation = async ({
   const leafOk = await leaf.verify({ publicKey: intermediate, date: now })
   const intOk = await intermediate.verify({ publicKey: root, date: now })
   if (!leafOk || !intOk) {
-    throw new AppAttestError('certificate chain does not validate to Apple root')
+    throw new AppAttestError('certificate chain does not validate to Apple root', {
+      reason: 'attestation_invalid',
+    })
   }
 
   // 3. The leaf's Apple extension must carry our computed nonce.
   const ext = leaf.getExtension(APPLE_APP_ATTEST_OID)
-  if (!ext) throw new AppAttestError('leaf missing App Attest nonce extension')
+  if (!ext) {
+    throw new AppAttestError('leaf missing App Attest nonce extension', {
+      reason: 'attestation_invalid',
+    })
+  }
   const certNonce = extractAttestationNonce(new Uint8Array(ext.value))
   if (!bytesEqual(certNonce, nonce)) {
-    throw new AppAttestError('attestation nonce mismatch')
+    throw new AppAttestError('attestation nonce mismatch', {
+      reason: 'attestation_invalid',
+    })
   }
 
   // 4. credentialId in authData must equal SHA256(public key) and the keyId.
@@ -120,57 +119,63 @@ export const verifyAttestation = async ({
 
   const parsed = parseAuthData(att.authData)
   if (!parsed.credentialId || !bytesEqual(parsed.credentialId, publicKeyHash)) {
-    throw new AppAttestError('credentialId != SHA256(publicKey)')
+    throw new AppAttestError('credentialId != SHA256(publicKey)', {
+      reason: 'attestation_invalid',
+    })
   }
-  if (!bytesEqual(base64ToBytes(keyId), publicKeyHash)) {
-    throw new AppAttestError('keyId != SHA256(publicKey)')
+
+  let decodedKeyId: Uint8Array
+  try {
+    decodedKeyId = base64ToBytes(keyId)
+  } catch (e) {
+    throw new AppAttestError('keyId is not valid base64', {
+      reason: 'attestation_invalid',
+      cause: e,
+    })
+  }
+  if (!bytesEqual(decodedKeyId, publicKeyHash)) {
+    throw new AppAttestError('keyId != SHA256(publicKey)', {
+      reason: 'attestation_invalid',
+    })
   }
 
   // 5. rpIdHash must hash our app id; attestation sign-count must be 0.
   const expectedRpId = await appIdRpHash(teamId, bundleId)
   if (!bytesEqual(parsed.rpIdHash, expectedRpId)) {
-    throw new AppAttestError('rpIdHash mismatch (wrong app id)')
+    throw new AppAttestError('rpIdHash mismatch (wrong app id)', {
+      reason: 'attestation_invalid',
+    })
   }
   if (parsed.signCount !== 0) {
-    throw new AppAttestError('attestation signCount must be 0')
+    throw new AppAttestError('attestation signCount must be 0', {
+      reason: 'attestation_invalid',
+    })
   }
 
   const environment = decodeEnvironment(parsed.aaguid)
   if (requireProduction && environment !== 'production') {
-    throw new AppAttestError('development attestation rejected')
+    throw new AppAttestError('development attestation rejected', {
+      reason: 'attestation_invalid',
+    })
   }
 
-  // First-writer-wins uuid→keyId pinning (ADR 0007). The crypto above only
-  // proves the caller controls THIS Secure-Enclave key; it says nothing about
-  // whether they may claim `uuid`. Without this, an attacker who knows a
-  // Supporter's uuid (the RevenueCat App User ID — an identifier, not a secret)
-  // could attest their own fresh key to it and ride the victim's entitlement,
-  // and anyone could mint unlimited fresh uuids for fresh free-credit buckets.
-  // So bind each identity to the FIRST key that attests it:
-  //   - unclaimed        → claim it, then proceed;
-  //   - owned by keyId    → idempotent re-attest of the same device, allow;
-  //   - owned by another  → reject (the impersonation boundary).
-  // TRADEOFF: strict first-writer-wins means a legitimate rotation to a NEW
-  // keyId under an existing uuid (e.g. the Enclave key was lost but the Keychain
-  // uuid survived a reinstall) is locked out and needs manual unbinding — an
-  // operator deletes `uuidOwner:<uuid>` and `key:<oldKeyId>` from KV. We accept
-  // that: protecting existing Supporters is the priority, and silent rebinding
-  // would defeat the fix. Write the owner pin BEFORE the key record so a partial
-  // failure is retry-safe: if the pin lands but the record write fails, the same
-  // keyId retries down the idempotent branch; the reverse ordering would leave
-  // `uuid` unclaimed while a key record exists, reopening the race.
-  const owner = await getUuidOwner(kv, uuid)
-  if (owner == null) {
-    await putUuidOwner(kv, uuid, keyId)
-  } else if (owner !== keyId) {
-    throw new AppAttestError('identity already bound to another device')
-  }
+  return { spki: bytesToBase64Url(spki), environment }
+}
 
-  await putKeyRecord(kv, keyId, {
-    spki: bytesToBase64Url(spki),
-    signCount: 0,
-    uuid,
-    environment,
-    attestedAt: Date.now(),
-  })
+/**
+ * Pure Apple attestation verification. Ownership, recovery authorization,
+ * challenge replay, and persistence live in the lifecycle module.
+ */
+export const verifyAttestationCryptography = async (
+  args: VerifyAttestationCryptographyArgs
+): Promise<VerifiedAttestation> => {
+  try {
+    return await verify(args)
+  } catch (e) {
+    if (e instanceof AppAttestError) throw e
+    throw new AppAttestError('attestation verification failed', {
+      reason: 'attestation_invalid',
+      cause: e,
+    })
+  }
 }
