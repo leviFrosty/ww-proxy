@@ -119,7 +119,7 @@ IOS_BUNDLE_ID = "com.leviwilkerson.jwtime"
 # RevenueCat entitlement that denotes a Supporter (server-side check).
 REVENUECAT_ENTITLEMENT_ID = "Supporter"
 # Notes Import knobs — all optional; see src/notesImport/config.ts for defaults.
-# NOTES_IMPORT_MODEL = "deepseek/deepseek-v4-flash"
+NOTES_IMPORT_MODEL = "deepseek/deepseek-v4-flash-0731"
 # NOTES_IMPORT_PROVIDERS = "fireworks,digitalocean"   # Western ZDR, priority order (ADR 0008)
 # NOTES_IMPORT_MAX_CHARS = "100000"
 # NOTES_IMPORT_MAX_OUTPUT_TOKENS = "16000"
