@@ -615,4 +615,115 @@ describe('App Attest route compatibility', () => {
     }
     expect(index.checkCredit).not.toHaveBeenCalled()
   })
+
+  it('keeps the attested repair path open while the kill-switch disables imports', async () => {
+    // The app's Tools-screen repair heals a key Apple refuses to sign with by
+    // walking challenge → attest (rotate under the recovery token) → verify.
+    // The kill-switch guards inference spend; these three routes spend none, so
+    // disabling Notes Import must never close the repair path.
+    const issueChallenge = vi.fn(async (request: Record<string, unknown>) => ({
+      ok: true as const,
+      value: {
+        protocolVersion: 2 as const,
+        operation: 'assert' as const,
+        operationId: request.operationId as string,
+        challenge: 'C'.repeat(43),
+        expiresAt: 1_800_000,
+      },
+    }))
+    const register = vi.fn(async () => ({
+      ok: true as const,
+      value: {
+        ok: true as const,
+        protocolVersion: 2 as const,
+        operationId: 'bind-operation-1',
+        status: 'rotated' as const,
+        recoveryEnrolled: true as const,
+      },
+    }))
+    const verifyAssertion = vi.fn(async () => ({
+      ok: true as const,
+      value: {
+        ok: true as const,
+        protocolVersion: 2 as const,
+        operationId: 'verify-operation-1',
+      },
+    }))
+    const kv = makeMemoryKv()
+    await kv.put('notes-import:enabled', 'disabled')
+    await kv.put('notes-import:provider-health', 'up')
+    const environment = {
+      NOTES_KV: kv,
+      OPENROUTER_API_KEY: 'openrouter-test',
+      APP_ATTEST_IDENTITY: {
+        idFromName: () => ({ toString: () => 'identity-id' }),
+        get: () => ({ issueChallenge, register, verifyAssertion }),
+      },
+    } as unknown as Environment
+
+    const kickoff = await handleNotesImportKickoffRequest(
+      context(environment, { body: {} })
+    )
+    expect(kickoff.status).toBe(503)
+    await expect(kickoff.json()).resolves.toMatchObject({
+      code: 'unavailable',
+      detail: 'disabled',
+    })
+
+    const challenge = await handleChallengeRequest(
+      context(environment, {
+        body: {
+          protocolVersion: 2,
+          operation: 'assert',
+          operationId: 'assert-operation-1',
+          uuid: UUID,
+          keyId: `${'A'.repeat(43)}=`,
+          purpose: 'notes-import-verify',
+          accountId: 'account-id',
+          contentHash: CONTENT_HASH,
+          requestHash: CONTENT_HASH,
+        },
+      })
+    )
+    expect(challenge.status).toBe(200)
+    expect(issueChallenge).toHaveBeenCalledTimes(1)
+
+    const attest = await handleAttestRequest(
+      context(environment, {
+        body: {
+          protocolVersion: 2,
+          operation: 'bind',
+          operationId: 'bind-operation-1',
+          uuid: UUID,
+          keyId: `${'A'.repeat(43)}=`,
+          challenge: 'C'.repeat(43),
+          attestation: 'attestation',
+          recoveryToken: 'R'.repeat(43),
+        },
+      })
+    )
+    expect(attest.status).toBe(200)
+    await expect(attest.json()).resolves.toMatchObject({ status: 'rotated' })
+
+    const verify = await handleNotesImportVerifyRequest(
+      context(environment, {
+        body: {
+          protocolVersion: 2,
+          operation: 'assert',
+          operationId: 'verify-operation-1',
+          purpose: 'notes-import-verify',
+          uuid: UUID,
+          accountId: 'account-id',
+          keyId: `${'A'.repeat(43)}=`,
+          challenge: 'C'.repeat(43),
+          assertion: 'assertion',
+          contentHash: CONTENT_HASH,
+          requestHash: CONTENT_HASH,
+        },
+      })
+    )
+    expect(verify.status).toBe(200)
+    await expect(verify.json()).resolves.toMatchObject({ ok: true })
+    expect(verifyAssertion).toHaveBeenCalledTimes(1)
+  })
 })
