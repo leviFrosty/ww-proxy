@@ -1,3 +1,4 @@
+import { z } from 'zod'
 import type { Environment } from '../types'
 
 /**
@@ -289,6 +290,91 @@ export const resolveNotesImportLimits = async (
     windowDays,
   }
 }
+
+const MIN_APP_VERSION_KEY = 'notes-import:min-version'
+const MIN_APP_VERSION_CACHE_TTL_SECONDS = 60
+/** Strict `major.minor.patch` — matches the app's `app.config.ts` version. */
+const SEMVER_PATTERN = /^\d+\.\d+\.\d+$/
+
+/** A trimmed `major.minor.patch` string. Shared by the KV and env schemas. */
+const appVersionSchema = z.string().trim().regex(SEMVER_PATTERN)
+
+/**
+ * KV `notes-import:min-version` document: `{ "minVersion": "1.42.0" }` or a bare
+ * `"1.42.0"` string. Normalised to the version string.
+ */
+const kvMinAppVersionSchema = z
+  .union([z.object({ minVersion: appVersionSchema }), appVersionSchema])
+  .transform((value) => (typeof value === 'string' ? value : value.minVersion))
+
+/** JSON when it parses, otherwise the raw text (an unquoted `1.42.0`). */
+const parseJsonOrRaw = (raw: string): unknown => {
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return raw
+  }
+}
+
+/**
+ * Parse a raw KV `notes-import:min-version` value into a `major.minor.patch`
+ * string, or null when it isn't one. Pure — never throws, never logs.
+ */
+export const parseMinAppVersion = (raw: string): string | null => {
+  const result = kvMinAppVersionSchema.safeParse(parseJsonOrRaw(raw))
+  return result.success ? result.data : null
+}
+
+const isBlank = (value: string | null | undefined): boolean =>
+  value == null || value.trim() === ''
+
+const readMinAppVersionFromKv = async (
+  kv: LimitsKv
+): Promise<string | null> => {
+  let raw: string | null
+  try {
+    raw = await kv.get(MIN_APP_VERSION_KEY, {
+      cacheTtl: MIN_APP_VERSION_CACHE_TTL_SECONDS,
+    })
+  } catch (error) {
+    console.warn('notes-import min-version KV read failed', error)
+    return null
+  }
+  if (raw == null || isBlank(raw)) return null
+
+  const version = parseMinAppVersion(raw)
+  if (version == null) {
+    console.warn('notes-import min-version KV value is invalid')
+  }
+  return version
+}
+
+const readMinAppVersionFromEnv = (env: Environment): string | null => {
+  const raw = env.NOTES_IMPORT_MIN_APP_VERSION
+  if (raw == null || isBlank(raw)) return null
+
+  const result = appVersionSchema.safeParse(raw)
+  if (result.success) return result.data
+  console.warn('NOTES_IMPORT_MIN_APP_VERSION is invalid')
+  return null
+}
+
+/**
+ * Resolve the minimum app version allowed to use Notes Import, or null when
+ * unset. Resolution: KV `notes-import:min-version` → `NOTES_IMPORT_MIN_APP_VERSION`
+ * env var → null. KV accepts `{"minVersion":"1.42.0"}`, a bare JSON string, or
+ * an unquoted `1.42.0`. Invalid values are warned about and ignored — never
+ * throws, never blocks.
+ *
+ * Bump this when a deploy changes the request/response contract in a way older
+ * app builds can't handle. The app compares it against its own
+ * `Constants.expoConfig.version` and disables the composer when below.
+ */
+export const resolveNotesImportMinAppVersion = async (
+  env: Environment,
+  kv: LimitsKv
+): Promise<string | null> =>
+  (await readMinAppVersionFromKv(kv)) ?? readMinAppVersionFromEnv(env)
 
 /** Select tier policy; dev bypass changes allowances only, never entitlement. */
 export const selectEffectiveAllowances = (

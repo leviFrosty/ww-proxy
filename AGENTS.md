@@ -83,6 +83,24 @@ code default. Allowances accept integer `-1` (unlimited), `0` (none), or a
 positive value; `windowDays` accepts any positive finite number, including
 fractions for short dev windows.
 
+### Minimum app version
+
+`GET /notes-import/status` also returns `minAppVersion` (`major.minor.patch`)
+when a floor is configured. The app compares it against its own
+`app.config.ts` version; below the floor it disables the Notes Import composer
+and shows an "update required" message with an App Store link. The worker does
+not reject requests — this is a client-side gate only. Bump it right after
+deploying a contract-breaking change:
+
+```bash
+wrangler kv key put --binding NOTES_KV notes-import:min-version '{"minVersion":"1.42.0"}'            # production
+wrangler kv key put --binding NOTES_KV notes-import:min-version '{"minVersion":"1.42.0"}' --env dev  # development
+wrangler kv key delete --binding NOTES_KV notes-import:min-version                                   # remove the floor
+```
+
+Resolution is KV → `NOTES_IMPORT_MIN_APP_VERSION` env var → unset (no floor);
+invalid values are logged and ignored. The read is edge-cached for 60 seconds.
+
 To reset one meter's rolling aggregate and Empty Import rows while preserving
 permanent replay/refinement records, copy `.env.example` to the gitignored
 `.env`, set the environment-specific token/URL, then run:
