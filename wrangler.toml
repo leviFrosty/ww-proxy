@@ -153,6 +153,15 @@ NOTES_IMPORT_WINDOW_DAYS = "30"
 # (add `--env dev` for the dev worker). The endpoint also auto-disables when no
 # allowlisted ZDR provider is healthy (OpenRouter metadata, no inference cost),
 # cached under `notes-import:provider-health`.
+#
+# Minimum app version (read by GET /notes-import/status as `minAppVersion`,
+# cacheTtl 60; KV > NOTES_IMPORT_MIN_APP_VERSION var > unset). Bump after a
+# deploy that breaks the contract for older app builds; the app compares it to
+# its own app.config.ts version, disables the Notes Import composer when below,
+# and prompts the user to update. The worker does NOT reject requests itself.
+#   wrangler kv key put --binding NOTES_KV notes-import:min-version '{"minVersion":"1.42.0"}'
+#   wrangler kv key delete --binding NOTES_KV notes-import:min-version   # remove the floor
+# (add `--env dev` for the dev worker).
 [[kv_namespaces]]
 binding = "NOTES_KV"
 id = "92871586e6dc4558a6ad3552ed7ee28c"

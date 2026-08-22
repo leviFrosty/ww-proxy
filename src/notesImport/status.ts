@@ -1,5 +1,6 @@
 import {
   resolveNotesImportLimits,
+  resolveNotesImportMinAppVersion,
   type NotesImportConfig,
   type NotesImportLimits,
 } from './config'
@@ -62,6 +63,12 @@ export interface NotesImportCapabilities {
 
 export type NotesImportStatusResponse = NotesImportStatusState & {
   capabilities: NotesImportCapabilities
+  /**
+   * Minimum app version (`major.minor.patch`) that can use Notes Import; omitted
+   * when no floor is configured. Clients below it disable the composer
+   * client-side and prompt for an update — the worker does not enforce it.
+   */
+  minAppVersion?: string
 }
 
 const NOTES_IMPORT_CAPABILITIES: NotesImportCapabilities = {
@@ -278,7 +285,14 @@ const resolveNotesImportStatus = async ({
 
 export const getNotesImportStatus = async (
   dependencies: NotesImportStatusDeps
-): Promise<NotesImportStatusResponse> => ({
-  ...(await resolveNotesImportStatus(dependencies)),
-  capabilities: NOTES_IMPORT_CAPABILITIES,
-})
+): Promise<NotesImportStatusResponse> => {
+  const [state, minAppVersion] = await Promise.all([
+    resolveNotesImportStatus(dependencies),
+    resolveNotesImportMinAppVersion(dependencies.env, dependencies.kv),
+  ])
+  return {
+    ...state,
+    capabilities: NOTES_IMPORT_CAPABILITIES,
+    ...(minAppVersion ? { minAppVersion } : {}),
+  }
+}

@@ -329,3 +329,72 @@ describe('getNotesImportStatus — provider health and caching', () => {
     expect(fetchFn).not.toHaveBeenCalled()
   })
 })
+
+describe('getNotesImportStatus — minAppVersion', () => {
+  const healthyFetch = () =>
+    okFetch(endpointsBody([{ provider_name: 'Fireworks', status: 0 }]))
+
+  it('omits minAppVersion when nothing is configured', async () => {
+    const result = await getStatus(makeMemoryKv(), healthyFetch())
+    expect(result).not.toHaveProperty('minAppVersion')
+  })
+
+  it('surfaces the KV record value', async () => {
+    const kv = makeMemoryKv()
+    await kv.put('notes-import:min-version', JSON.stringify({ minVersion: '1.42.0' }))
+    await expect(getStatus(kv, healthyFetch())).resolves.toMatchObject({
+      available: true,
+      minAppVersion: '1.42.0',
+    })
+  })
+
+  it('accepts a bare string value', async () => {
+    const kv = makeMemoryKv()
+    await kv.put('notes-import:min-version', '1.42.0')
+    await expect(getStatus(kv, healthyFetch())).resolves.toMatchObject({
+      minAppVersion: '1.42.0',
+    })
+  })
+
+  it('still reports minAppVersion alongside the kill-switch', async () => {
+    const kv = makeMemoryKv()
+    await kv.put('notes-import:enabled', 'false')
+    await kv.put('notes-import:min-version', '"1.42.0"')
+    await expect(getStatus(kv, healthyFetch())).resolves.toEqual({
+      ...APP_ATTEST_CAPABILITIES,
+      available: false,
+      reason: 'disabled',
+      minAppVersion: '1.42.0',
+    })
+  })
+
+  it('falls back to the env var and ignores an invalid KV value', async () => {
+    const kv = makeMemoryKv()
+    await kv.put('notes-import:min-version', JSON.stringify({ minVersion: 'v1.42' }))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await expect(
+      getNotesImportStatus({
+        kv: kv as unknown as StatusKv,
+        env: { NOTES_IMPORT_MIN_APP_VERSION: '1.40.0' } as Environment,
+        apiKey: 'k',
+        config: CONFIG,
+        fetchFn: healthyFetch(),
+      })
+    ).resolves.toMatchObject({ minAppVersion: '1.40.0' })
+    expect(warn).toHaveBeenCalled()
+    warn.mockRestore()
+  })
+
+  it('omits minAppVersion when the env var is invalid', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const result = await getNotesImportStatus({
+      kv: makeMemoryKv() as unknown as StatusKv,
+      env: { NOTES_IMPORT_MIN_APP_VERSION: 'latest' } as Environment,
+      apiKey: 'k',
+      config: CONFIG,
+      fetchFn: healthyFetch(),
+    })
+    expect(result).not.toHaveProperty('minAppVersion')
+    warn.mockRestore()
+  })
+})

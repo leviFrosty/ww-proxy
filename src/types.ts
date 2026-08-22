@@ -111,6 +111,13 @@ export interface Environment {
   /** Fixed import-window duration in days; positive fractions allowed. Default 30. */
   NOTES_IMPORT_WINDOW_DAYS?: string;
 
+  /**
+   * Minimum app version (`major.minor.patch`) allowed to use Notes Import;
+   * surfaced as `minAppVersion` on GET /notes-import/status. KV
+   * `notes-import:min-version` overrides. Unset = no floor.
+   */
+  NOTES_IMPORT_MIN_APP_VERSION?: string;
+
   /** Rolling window (seconds) for counting free Empty Imports. Default 604800 (7d). */
   NOTES_IMPORT_EMPTY_WINDOW_SECONDS?: string;
 
