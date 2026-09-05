@@ -213,3 +213,13 @@ logs.persist = true
 # wrangler secret put ADMIN_API_TOKEN                # dedicated prod reset token
 # wrangler secret put ADMIN_API_TOKEN --env dev      # DIFFERENT dev reset token
 # Generate each admin token with: openssl rand -base64 32
+
+# Private buckets: expose only validated public paths through the Worker.
+# Named environments do not inherit R2 bindings.
+[[r2_buckets]]
+binding = "ANNOUNCEMENTS_BUCKET"
+bucket_name = "ww-announcements"
+
+[[env.dev.r2_buckets]]
+binding = "ANNOUNCEMENTS_BUCKET"
+bucket_name = "ww-announcements-dev"

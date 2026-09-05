@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { announcementRoute } from "./announcements/route";
 import type { MiddlewareHandler } from "hono";
 import type {
   Environment,
@@ -84,6 +85,9 @@ app.use("/admin/*", rateLimitMiddleware);
 app.get("/geocode", handleGeocodeRequest);
 app.get("/autocomplete", handleAutocompleteRequest);
 app.get("/health", handleHealthCheckRequest);
+// Public announcements are independent of Notes Import auth and rate limits.
+app.all("/announcements/*", announcementRoute);
+app.all("/admin/announcements/*", announcementRoute);
 // Notes Import: availability probe, App Attest handshake + the metered call.
 app.get("/notes-import/status", handleNotesImportStatusRequest);
 app.post("/notes-import/challenge", handleChallengeRequest);

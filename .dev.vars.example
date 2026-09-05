@@ -27,7 +27,7 @@ REVENUECAT_API_KEY=sk_your_revenuecat_secret_here
 # sending header `x-ww-dev-bypass: <this value>`. Leave UNSET in production.
 NOTES_IMPORT_DEV_BYPASS_TOKEN=local-dev-bypass
 
-# Dedicated local admin-reset token. Do not reuse the dev-bypass token.
+# Dedicated local admin token (usage resets and announcements). Do not reuse the dev-bypass token.
 ADMIN_API_TOKEN=generate_with_openssl_rand_base64_32
 
 # Optional local fallbacks for the runtime `notes-import:limits` KV document.
