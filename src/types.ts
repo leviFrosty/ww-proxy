@@ -25,6 +25,9 @@ export interface Environment {
   APPLE_TEAM_ID: string;
   RATE_LIMITER: RateLimit;
 
+  /** Private, environment-specific announcement drafts, releases, and images. */
+  ANNOUNCEMENTS_BUCKET: R2Bucket;
+
   // --- Notes Import ------------------------------------------------------
 
   /**
@@ -153,7 +156,7 @@ export interface Environment {
    */
   NOTES_IMPORT_DEV_BYPASS_TOKEN?: string;
 
-  /** Dedicated admin reset credential. Secret; distinct per prod/dev worker. */
+  /** Dedicated maintainer credential (usage reset and announcements). Secret; distinct per prod/dev worker. */
   ADMIN_API_TOKEN?: string;
 }
 

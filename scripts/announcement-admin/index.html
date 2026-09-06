@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WitnessWork announcements</title>
+    <link rel="stylesheet" href="/client.css" />
+    <script type="module" src="/client.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <p class="eyebrow">
+            WitnessWork · <span id="environment">Connecting</span>
+          </p>
+          <h1>Announcements</h1>
+          <p id="worker" class="muted"></p>
+        </div>
+        <button id="reload">Reload saved state</button>
+      </header>
+      <section class="status-grid">
+        <div>
+          <h2>Current publication</h2>
+          <p id="current">Loading…</p>
+          <button id="edit-current">Edit current</button
+          ><button id="unpublish" class="danger">Unpublish</button>
+        </div>
+        <div>
+          <h2>Working draft</h2>
+          <p id="draft-status">Loading…</p>
+          <button id="new">New announcement</button
+          ><button id="save">Save draft</button>
+        </div>
+      </section>
+      <p id="message" role="status" aria-live="polite"></p>
+      <fieldset id="form">
+        <legend>Announcement</legend>
+        <div class="row">
+          <label class="grow"
+            >Announcement ID<input
+              id="announcement-id"
+              maxlength="80"
+              required /></label
+          ><label class="check"
+            ><input type="checkbox" id="dismissible" checked />Allow
+            dismissal</label
+          ><label class="check"
+            ><input type="checkbox" id="signature" checked />Show author
+            signature</label
+          >
+        </div>
+        <p class="hint">
+          Editing the same ID keeps previous dismissals. A new ID shows the
+          announcement again to everyone.
+        </p>
+        <div class="row">
+          <label class="grow"
+            >Starts at (optional, local time)<input
+              id="starts-at"
+              type="datetime-local" /></label
+          ><label class="grow"
+            >Expires at (optional, local time)<input
+              id="expires-at"
+              type="datetime-local"
+          /></label>
+        </div>
+        <div class="row locale-row">
+          <label>Language<select id="locale"></select></label>
+          <p id="locale-status" class="hint"></p>
+        </div>
+        <label
+          >Banner text<input
+            id="banner-text"
+            maxlength="180"
+            required
+            placeholder="A short invitation to read the announcement"
+        /></label>
+        <label
+          >Title<input
+            id="title"
+            maxlength="160"
+            required
+            placeholder="Announcement title"
+        /></label>
+        <div class="editor-actions">
+          <div role="group" aria-label="Editor mode">
+            <button id="rich-mode" aria-pressed="true">Rich text</button
+            ><button id="markdown-mode" aria-pressed="false">Markdown</button>
+          </div>
+          <div>
+            <button id="import-md">Import .md</button
+            ><button id="export-md">Export .md</button
+            ><button id="upload-image">Upload image</button>
+          </div>
+        </div>
+        <div id="editor"></div>
+        <textarea
+          id="markdown"
+          aria-label="Announcement Markdown"
+          maxlength="12000"
+          hidden
+        ></textarea>
+        <p class="hint">
+          Use headings, bold, italic, lists, links, and uploaded images. Only
+          HTTPS / mailto links and images uploaded here are supported. No HTML
+          or embedded video.
+        </p>
+      </fieldset>
+      <section>
+        <h2>Languages and publication</h2>
+        <p id="completeness"></p>
+        <div id="languages"></div>
+        <p class="hint">
+          Translate missing or stale languages using your locally signed-in CLI,
+          then review the results here. Publish uses the current draft and
+          requires all languages to match the English source.
+        </p>
+        <div class="row">
+          <label
+            >Translation agent<select id="agent">
+              <option value="codex">Codex</option>
+              <option value="claude">Claude</option>
+            </select></label
+          ><button id="translate">Translate missing / stale</button
+          ><button id="publish" class="primary">Publish</button>
+        </div>
+      </section>
+      <section>
+        <h2>History</h2>
+        <p class="hint">
+          Restore a revision into the working draft, then publish when ready.
+          Restoring retains its original ID.
+        </p>
+        <div id="history"></div>
+      </section>
+      <footer>
+        <button id="export-json">Export complete draft .json</button
+        ><button id="import-json">Import draft .json</button>
+        <p class="hint">
+          Drafts are saved to the selected environment only when you choose Save
+          draft. Keep an export before replacing unsaved work.
+        </p>
+      </footer>
+      <input type="file" id="file-input" hidden />
+    </main>
+  </body>
+</html>

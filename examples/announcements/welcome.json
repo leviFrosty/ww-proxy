@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "announcement": {
+    "id": "welcome-example",
+    "dismissible": true,
+    "signature": true,
+    "locales": {
+      "en-us": {
+        "bannerText": "A note from WitnessWork",
+        "title": "Thank you for being here",
+        "markdown": "## Thank you for using WitnessWork\n\nWe appreciate your feedback as we continue improving WitnessWork.\n\n- Keep track of your service time.\n- Plan the days ahead.\n- Review your progress in one place.\n\nThank you for your support.\n"
+      }
+    }
+  }
+}
